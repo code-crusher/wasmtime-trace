@@ -15,6 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::{Poll, ready};
 use std::time::Duration;
+use tokio::io::ReadBuf;
 
 /// Value taken from rust std library.
 const DEFAULT_BACKLOG: u32 = 128;
@@ -662,7 +663,15 @@ pub(crate) struct TcpReceiveStream {
 }
 impl TcpReceiveStream {
     pub(crate) fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<()> {
-        self.inner.poll_read_ready(cx).map(|_| ())
+        // Don't rely on `poll_read_ready` here: tokio's cached read readiness
+        // can already be set on a freshly-connected socket, before any data
+        // has arrived, which would make us report an idle stream as ready.
+        // Peeking a single byte only completes once there is actually
+        // something to read (data, end of stream or an error), and clears
+        // tokio's cached readiness if there isn't.
+        let mut buf = [0u8; 1];
+        let mut buf = ReadBuf::new(&mut buf);
+        self.inner.poll_peek(cx, &mut buf).map(|_| ())
     }
 
     pub(crate) fn poll_read(

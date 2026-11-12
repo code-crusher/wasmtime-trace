@@ -3,6 +3,18 @@ use test_programs::wasi::io::streams::{InputStream, OutputStream, StreamError};
 use test_programs::wasi::sockets::network::{IpAddress, IpAddressFamily, IpSocketAddress, Network};
 use test_programs::wasi::sockets::tcp::{ShutdownType, TcpSocket};
 
+/// The pollable of an idle input-stream should not report ready before any data has arrived.
+/// See: https://github.com/bytecodealliance/wasmtime/issues/14986
+fn test_tcp_input_stream_should_not_be_ready_before_any_data_arrives(
+    net: &Network,
+    family: IpAddressFamily,
+) {
+    setup(net, family, |_server, client| {
+        // Nothing has been sent in either direction, so the pollable should not be ready:
+        assert!(!client.input.subscribe().ready());
+    });
+}
+
 /// InputStream::read should return `StreamError::Closed` after the connection has been shut down by the server.
 fn test_tcp_input_stream_should_be_closed_by_remote_shutdown(
     net: &Network,
@@ -152,6 +164,7 @@ fn test_tcp_nonblocking_write_loop(net: &Network, family: IpAddressFamily) {
 fn main() {
     let net = Network::default();
 
+    test_tcp_input_stream_should_not_be_ready_before_any_data_arrives(&net, IpAddressFamily::Ipv4);
     test_tcp_input_stream_should_be_closed_by_remote_shutdown(&net, IpAddressFamily::Ipv4);
     test_tcp_input_stream_should_be_closed_by_local_shutdown(&net, IpAddressFamily::Ipv4);
     test_tcp_output_stream_should_be_closed_by_local_shutdown(&net, IpAddressFamily::Ipv4);
@@ -160,6 +173,10 @@ fn main() {
     test_tcp_nonblocking_write_loop(&net, IpAddressFamily::Ipv4);
 
     if supports_ipv6() {
+        test_tcp_input_stream_should_not_be_ready_before_any_data_arrives(
+            &net,
+            IpAddressFamily::Ipv6,
+        );
         test_tcp_input_stream_should_be_closed_by_remote_shutdown(&net, IpAddressFamily::Ipv6);
         test_tcp_input_stream_should_be_closed_by_local_shutdown(&net, IpAddressFamily::Ipv6);
         test_tcp_output_stream_should_be_closed_by_local_shutdown(&net, IpAddressFamily::Ipv6);
