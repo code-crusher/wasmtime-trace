@@ -388,7 +388,14 @@ impl RunCommand {
         let host = Host::default();
 
         let mut store = Store::new(&engine, host);
-        self.populate_with_wasi(&mut linker, &mut store)?;
+        #[cfg(feature = "component-model")]
+        let component = match main {
+            RunTarget::Component(c) => Some(c),
+            RunTarget::Core(_) => None,
+        };
+        #[cfg(not(feature = "component-model"))]
+        let component = None;
+        self.populate_with_wasi(&mut linker, &mut store, component)?;
         self.run.configure_store(&mut store, |t| &mut t.limits)?;
 
         Ok((store, linker))
@@ -1138,7 +1145,12 @@ impl RunCommand {
     }
 
     /// Populates the given `Linker` with WASI APIs.
-    fn populate_with_wasi(&self, linker: &mut CliLinker, store: &mut Store<Host>) -> Result<()> {
+    fn populate_with_wasi(
+        &self,
+        linker: &mut CliLinker,
+        store: &mut Store<Host>,
+        component: Option<&wasmtime::component::Component>,
+    ) -> Result<()> {
         self.run.validate_p3_option()?;
         let cli = self.run.validate_cli_enabled()?;
 
@@ -1168,6 +1180,11 @@ impl RunCommand {
                 #[cfg(feature = "component-model")]
                 CliLinker::Component(linker) => {
                     self.run.add_wasmtime_wasi_to_linker(linker)?;
+                    if let Some(component) = component {
+                        self.run.add_named_wasmtime_wasi_to_linker(
+                            linker, component, false,
+                        )?;
+                    }
                     self.set_wasi_ctx(store)?;
                 }
             }
@@ -1290,6 +1307,10 @@ impl RunCommand {
                         #[cfg(feature = "component-model-async")]
                         if self.run.common.wasi.p3.unwrap_or(crate::common::P3_DEFAULT) {
                             wasmtime_wasi_http::p3::add_to_linker(linker)?;
+                        }
+                        if let Some(component) = component {
+                            self.run
+                                .add_named_wasmtime_wasi_http_to_linker(linker, component)?;
                         }
                     }
                 }
@@ -1423,6 +1444,14 @@ impl WasiView for Host {
     }
 }
 
+// Labelled WASI imports (`import env2: wasi:cli/environment;`) are all bound
+// to the default context, see `RunCommon::add_named_wasmtime_wasi_to_linker`.
+impl wasmtime_wasi::WasiNamedView for Host {
+    fn ctx(&mut self, _id: wasmtime_wasi::NamedId) -> WasiCtxView<'_> {
+        WasiView::ctx(self)
+    }
+}
+
 #[cfg(feature = "wasi-http")]
 impl wasmtime_wasi_http::WasiHttpView for Host {
     fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
@@ -1432,6 +1461,15 @@ impl wasmtime_wasi_http::WasiHttpView for Host {
             ctx,
             hooks: &mut self.wasi_http_hooks,
         }
+    }
+}
+
+// Labelled `wasi:http` imports are bound to the default HTTP context for the
+// same reason labelled WASI imports are.
+#[cfg(feature = "wasi-http")]
+impl wasmtime_wasi_http::WasiHttpNamedView for Host {
+    fn http(&mut self, _id: wasmtime_wasi::NamedId) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::WasiHttpView::http(self)
     }
 }
 

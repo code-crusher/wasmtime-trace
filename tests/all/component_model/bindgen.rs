@@ -1884,3 +1884,54 @@ mod named_imports_resources_async {
         Ok(())
     }
 }
+
+mod labelled_exports {
+    use super::*;
+
+    wasmtime::component::bindgen!({
+        inline: "
+            package demo:pkg;
+
+            interface store {
+                get: func() -> u32;
+            }
+
+            world w {
+                export store;
+            }
+        ",
+    });
+
+    // A component which exports `demo:pkg/store` under the label `h` rather
+    // than its interface name. The generated bindings must fall back to
+    // looking for a labelled export.
+    const COMPONENT: &str = r#"
+        (component
+            (core module $m
+                (func (export "get") (result i32) i32.const 42)
+            )
+            (core instance $i (instantiate $m))
+            (func $get (result u32) (canon lift (core func $i "get")))
+            (instance $inst (export "get" (func $get)))
+            (export "h" (implements "demo:pkg/store") (instance $inst))
+        )
+    "#;
+
+    fn implements_engine() -> Engine {
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        config.wasm_component_model_implements(true);
+        Engine::new(&config).unwrap()
+    }
+
+    #[test]
+    fn labelled_export_is_found() -> Result<()> {
+        let engine = implements_engine();
+        let component = Component::new(&engine, COMPONENT)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let w = W::instantiate(&mut store, &component, &linker)?;
+        assert_eq!(w.demo_pkg_store().call_get(&mut store)?, 42);
+        Ok(())
+    }
+}

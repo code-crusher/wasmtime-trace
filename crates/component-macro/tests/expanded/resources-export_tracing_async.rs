@@ -337,14 +337,35 @@ pub mod exports {
                     pub fn new<_T>(
                         _instance_pre: &wasmtime::component::InstancePre<_T>,
                     ) -> wasmtime::Result<GuestIndices> {
-                        let instance = _instance_pre
-                            .component()
+                        let _component = _instance_pre.component();
+                        let instance = match _component
                             .get_export_index(None, "foo:foo/simple-export")
-                            .ok_or_else(|| {
-                                wasmtime::format_err!(
-                                    "no exported instance named `foo:foo/simple-export`"
-                                )
-                            })?;
+                        {
+                            Some(index) => index,
+                            None => {
+                                let _engine = _component.engine();
+                                let _ty = _component.component_type();
+                                let mut candidates = _ty
+                                    .exports(_engine)
+                                    .filter(|(_, e)| e.is_implements("foo:foo/simple-export"))
+                                    .map(|(name, _)| name);
+                                let name = candidates.next();
+                                match (name, candidates.next()) {
+                                    (Some(name), None) => {
+                                        _component
+                                            .get_export_index(None, name)
+                                            .expect("export was just found")
+                                    }
+                                    _ => {
+                                        return Err(
+                                            wasmtime::format_err!(
+                                                "no exported instance named `foo:foo/simple-export`"
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        };
                         let mut lookup = move |name: &str| {
                             _instance_pre
                                 .component()
@@ -534,14 +555,37 @@ pub mod exports {
                     pub fn new<_T>(
                         _instance_pre: &wasmtime::component::InstancePre<_T>,
                     ) -> wasmtime::Result<GuestIndices> {
-                        let instance = _instance_pre
-                            .component()
+                        let _component = _instance_pre.component();
+                        let instance = match _component
                             .get_export_index(None, "foo:foo/export-using-import")
-                            .ok_or_else(|| {
-                                wasmtime::format_err!(
-                                    "no exported instance named `foo:foo/export-using-import`"
-                                )
-                            })?;
+                        {
+                            Some(index) => index,
+                            None => {
+                                let _engine = _component.engine();
+                                let _ty = _component.component_type();
+                                let mut candidates = _ty
+                                    .exports(_engine)
+                                    .filter(|(_, e)| {
+                                        e.is_implements("foo:foo/export-using-import")
+                                    })
+                                    .map(|(name, _)| name);
+                                let name = candidates.next();
+                                match (name, candidates.next()) {
+                                    (Some(name), None) => {
+                                        _component
+                                            .get_export_index(None, name)
+                                            .expect("export was just found")
+                                    }
+                                    _ => {
+                                        return Err(
+                                            wasmtime::format_err!(
+                                                "no exported instance named `foo:foo/export-using-import`"
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        };
                         let mut lookup = move |name: &str| {
                             _instance_pre
                                 .component()
@@ -742,14 +786,37 @@ pub mod exports {
                     pub fn new<_T>(
                         _instance_pre: &wasmtime::component::InstancePre<_T>,
                     ) -> wasmtime::Result<GuestIndices> {
-                        let instance = _instance_pre
-                            .component()
+                        let _component = _instance_pre.component();
+                        let instance = match _component
                             .get_export_index(None, "foo:foo/export-using-export1")
-                            .ok_or_else(|| {
-                                wasmtime::format_err!(
-                                    "no exported instance named `foo:foo/export-using-export1`"
-                                )
-                            })?;
+                        {
+                            Some(index) => index,
+                            None => {
+                                let _engine = _component.engine();
+                                let _ty = _component.component_type();
+                                let mut candidates = _ty
+                                    .exports(_engine)
+                                    .filter(|(_, e)| {
+                                        e.is_implements("foo:foo/export-using-export1")
+                                    })
+                                    .map(|(name, _)| name);
+                                let name = candidates.next();
+                                match (name, candidates.next()) {
+                                    (Some(name), None) => {
+                                        _component
+                                            .get_export_index(None, name)
+                                            .expect("export was just found")
+                                    }
+                                    _ => {
+                                        return Err(
+                                            wasmtime::format_err!(
+                                                "no exported instance named `foo:foo/export-using-export1`"
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        };
                         let mut lookup = move |name: &str| {
                             _instance_pre
                                 .component()
@@ -853,14 +920,37 @@ pub mod exports {
                     pub fn new<_T>(
                         _instance_pre: &wasmtime::component::InstancePre<_T>,
                     ) -> wasmtime::Result<GuestIndices> {
-                        let instance = _instance_pre
-                            .component()
+                        let _component = _instance_pre.component();
+                        let instance = match _component
                             .get_export_index(None, "foo:foo/export-using-export2")
-                            .ok_or_else(|| {
-                                wasmtime::format_err!(
-                                    "no exported instance named `foo:foo/export-using-export2`"
-                                )
-                            })?;
+                        {
+                            Some(index) => index,
+                            None => {
+                                let _engine = _component.engine();
+                                let _ty = _component.component_type();
+                                let mut candidates = _ty
+                                    .exports(_engine)
+                                    .filter(|(_, e)| {
+                                        e.is_implements("foo:foo/export-using-export2")
+                                    })
+                                    .map(|(name, _)| name);
+                                let name = candidates.next();
+                                match (name, candidates.next()) {
+                                    (Some(name), None) => {
+                                        _component
+                                            .get_export_index(None, name)
+                                            .expect("export was just found")
+                                    }
+                                    _ => {
+                                        return Err(
+                                            wasmtime::format_err!(
+                                                "no exported instance named `foo:foo/export-using-export2`"
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        };
                         let mut lookup = move |name: &str| {
                             _instance_pre
                                 .component()

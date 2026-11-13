@@ -193,6 +193,28 @@ where
     Ok(())
 }
 
+/// Same as [`add_named_to_linker`] except that this only adds interfaces
+/// present in the `wasi:http/service` world.
+///
+/// This is the named-import analogue of the interfaces added by
+/// [`wasmtime_wasi_http::p3::add_to_linker`], which is what `wasmtime serve`
+/// provides when `-Scli` isn't passed.
+///
+/// [`wasmtime_wasi_http::p3::add_to_linker`]: https://docs.rs/wasmtime-wasi-http/latest/wasmtime_wasi_http/p3/fn.add_to_linker.html
+pub fn add_named_to_linker_proxy_interfaces<T>(
+    linker: &mut Linker<T>,
+    component: &Component,
+    mut lookup: impl FnMut(Interface, &str) -> wasmtime::Result<NamedId>,
+) -> wasmtime::Result<()>
+where
+    T: WasiNamedView + 'static,
+{
+    cli::add_named_to_linker(linker, component, &mut lookup)?;
+    clocks::add_named_to_linker(linker, component, &mut lookup)?;
+    random::add_named_to_linker(linker, component, &mut lookup)?;
+    Ok(())
+}
+
 /// Interfaces that are added via [`add_named_to_linker`].
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Interface {

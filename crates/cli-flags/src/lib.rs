@@ -568,6 +568,14 @@ wasmtime_option_group! {
     pub struct WasiOptions {
         /// Enable support for WASI CLI APIs, including filesystems, sockets, clocks, and random.
         pub cli: Option<bool>,
+        /// Bind WASI interfaces imported under a label, e.g.
+        /// `import env2: wasi:cli/environment;`, to the default WASI context.
+        ///
+        /// The CLI has no way to configure a separate context per label, so
+        /// labelled imports are satisfied with the same context as unlabelled
+        /// imports. Disabling this means such imports are left unbound and
+        /// components using them fail to instantiate.
+        pub named_imports: Option<bool>,
         /// Enable WASI APIs marked as: @unstable(feature = cli-exit-with-code)
         pub cli_exit_with_code: Option<bool>,
         /// Deprecated alias for `cli`

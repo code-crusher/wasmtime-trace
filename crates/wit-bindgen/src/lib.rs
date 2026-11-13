@@ -780,8 +780,33 @@ impl Wasmtime {
 pub fn new<_T>(
     _instance_pre: &{wt}::component::InstancePre<_T>,
 ) -> {wt}::Result<{struct_name}Indices> {{
-    let instance = _instance_pre.component().get_export_index(None, \"{instance_name}\")
-        .ok_or_else(|| {wt}::format_err!(\"no exported instance named `{instance_name}`\"))?;
+    let _component = _instance_pre.component();
+    let instance = match _component.get_export_index(None, \"{instance_name}\") {{
+        Some(index) => index,
+        // If there's no export named after the interface itself then look for
+        // an export labelled with `(implements \"{instance_name}\")`, as long as
+        // exactly one such export exists. This allows components which export
+        // the interface under a name of their choosing to be used here.
+        None => {{
+            let _engine = _component.engine();
+            let _ty = _component.component_type();
+            let mut candidates = _ty
+                .exports(_engine)
+                .filter(|(_, e)| e.is_implements(\"{instance_name}\"))
+                .map(|(name, _)| name);
+            let name = candidates.next();
+            match (name, candidates.next()) {{
+                (Some(name), None) => _component
+                    .get_export_index(None, name)
+                    .expect(\"export was just found\"),
+                _ => {{
+                    return Err({wt}::format_err!(
+                        \"no exported instance named `{instance_name}`\"
+                    ));
+                }}
+            }}
+        }}
+    }};
     let mut lookup = move |name: &str| {{
         _instance_pre.component().get_export_index(Some(&instance), name).ok_or_else(|| {{
             {wt}::format_err!(

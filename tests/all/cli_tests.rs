@@ -767,6 +767,36 @@ fn component_unknown_imports_default() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(not(feature = "component-model"), ignore)]
+fn component_labelled_imports_and_exports() -> Result<()> {
+    let path = "tests/all/cli_tests/labelled-command.wat";
+
+    // Without `-Snamed-imports` the labelled `wasi:cli/environment` import
+    // can't be satisfied by the linker.
+    let output = get_wasmtime_command()?
+        .args(["run", "-Wcomponent-model-implements"])
+        .arg(path)
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("component imports instance `env2`"),
+        "bad stderr: {stderr}"
+    );
+
+    // With `-Snamed-imports` the import is bound to the default context and
+    // the labelled `wasi:cli/run` export is found and invoked.
+    run_wasmtime(&[
+        "run",
+        "-Wcomponent-model-implements",
+        "-Snamed-imports",
+        path,
+    ])?;
+
+    Ok(())
+}
+
+#[test]
 #[cfg_attr(not(feature = "component-model-async"), ignore)]
 fn component_unknown_imports_default_async() -> Result<()> {
     let path = "tests/all/cli_tests/component-unknown-imports-async.wat";
@@ -1787,6 +1817,37 @@ mod test_programs {
                 Err(e) => println!("failed to wait for child or read stdio: {e}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn serve_labelled_imports_and_exports() -> Result<()> {
+        let path = "tests/all/cli_tests/labelled-proxy.wat";
+
+        // Without `-Snamed-imports` the labelled `wasi:cli/environment` import
+        // can't be satisfied by the linker.
+        let output = super::get_wasmtime_command()?
+            .args([
+                "serve",
+                "--addr=127.0.0.1:0",
+                "-Wcomponent-model-implements",
+            ])
+            .arg(path)
+            .output()?;
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("component imports instance `env2`"),
+            "bad stderr: {stderr}"
+        );
+
+        // With `-Snamed-imports` the import is bound to the default context
+        // and the labelled `wasi:http/incoming-handler` export is found.
+        let server = WasmtimeServe::new(path, |cmd| {
+            cmd.arg("-Wcomponent-model-implements");
+            cmd.arg("-Snamed-imports");
+        })?;
+        server.finish()?;
+        Ok(())
     }
 
     #[tokio::test]

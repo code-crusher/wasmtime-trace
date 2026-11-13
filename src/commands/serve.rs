@@ -84,6 +84,14 @@ impl WasiView for Host {
     }
 }
 
+// Labelled WASI imports (`import env2: wasi:cli/environment;`) are all bound
+// to the default context, see `RunCommon::add_named_wasmtime_wasi_to_linker`.
+impl wasmtime_wasi::WasiNamedView for Host {
+    fn ctx(&mut self, _id: wasmtime_wasi::NamedId) -> WasiCtxView<'_> {
+        WasiView::ctx(self)
+    }
+}
+
 impl wasmtime_wasi_http::WasiHttpView for Host {
     fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
         wasmtime_wasi_http::WasiHttpCtxView {
@@ -91,6 +99,14 @@ impl wasmtime_wasi_http::WasiHttpView for Host {
             table: &mut self.table,
             hooks: &mut self.hooks,
         }
+    }
+}
+
+// Labelled `wasi:http` imports are bound to the default HTTP context for the
+// same reason labelled WASI imports are.
+impl wasmtime_wasi_http::WasiHttpNamedView for Host {
+    fn http(&mut self, _id: wasmtime_wasi::NamedId) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::WasiHttpView::http(self)
     }
 }
 
@@ -522,7 +538,7 @@ impl ServeCommand {
         Ok(store)
     }
 
-    fn add_to_linker(&self, linker: &mut Linker<Host>) -> Result<()> {
+    fn add_to_linker(&self, linker: &mut Linker<Host>, component: &Component) -> Result<()> {
         self.run.validate_p3_option()?;
         let cli = self.run.validate_cli_enabled()?;
 
@@ -600,6 +616,13 @@ impl ServeCommand {
             bail!("support for wasi-http must be enabled for `serve` subcommand");
         }
 
+        // Labelled WASI imports, e.g. `import env2: wasi:cli/environment;`, are
+        // all bound to the default context, matching how `wasmtime run` does it.
+        self.run
+            .add_named_wasmtime_wasi_to_linker(linker, component, cli != Some(true))?;
+        self.run
+            .add_named_wasmtime_wasi_http_to_linker(linker, component)?;
+
         Ok(())
     }
 
@@ -630,12 +653,14 @@ impl ServeCommand {
         let engine = Engine::new(&config)?;
         let mut linker = Linker::new(&engine);
 
-        self.add_to_linker(&mut linker)?;
-
         let component = match self.run.load_module(&engine, &self.component, None)? {
             RunTarget::Core(_) => bail!("The serve command currently requires a component"),
             RunTarget::Component(c) => c,
         };
+
+        // The component is loaded first as linking labelled imports requires
+        // knowing what the component imports.
+        self.add_to_linker(&mut linker, &component)?;
 
         #[cfg(feature = "debug")]
         if let Some(debug_run) = debug_run {

@@ -398,6 +398,62 @@ fn add_proxy_interfaces_nonblocking<T: WasiView>(linker: &mut Linker<T>) -> wasm
     Ok(())
 }
 
+/// Same as [`add_named_to_linker_async`] except that this only adds interfaces
+/// present in the `wasi:http/proxy` world.
+///
+/// This is the named-import analogue of
+/// [`add_to_linker_proxy_interfaces_async`] and is intended to be paired with
+/// it, for example when `wasi:http` is added via
+/// [`wasmtime_wasi_http::p2::add_named_to_linker_async`].
+///
+/// [`wasmtime_wasi_http::p2::add_named_to_linker_async`]: https://docs.rs/wasmtime-wasi-http/latest/wasmtime_wasi_http/p2/fn.add_named_to_linker_async.html
+pub fn add_named_to_linker_proxy_interfaces_async<T: WasiNamedView>(
+    linker: &mut Linker<T>,
+    component: &Component,
+    mut lookup: impl FnMut(Interface, &str) -> wasmtime::Result<NamedId>,
+) -> wasmtime::Result<()> {
+    use crate::p2::bindings::named_imports::wasi::{cli, clocks, random};
+
+    let l = linker;
+    clocks::wall_clock::add_to_linker::<T, WasiClocksNamed<T>>(
+        l,
+        component,
+        |name| lookup(Interface::ClocksWallClock, name),
+        |x| WasiCtxNamedView(x),
+    )?;
+    clocks::monotonic_clock::add_to_linker::<T, WasiClocksNamed<T>>(
+        l,
+        component,
+        |name| lookup(Interface::ClocksMonotonicClock, name),
+        |x| WasiCtxNamedView(x),
+    )?;
+    random::random::add_to_linker::<T, WasiRandomNamed<T>>(
+        l,
+        component,
+        |name| lookup(Interface::RandomRandom, name),
+        |x| WasiCtxNamedView(x),
+    )?;
+    cli::stdin::add_to_linker::<T, WasiCliNamed<T>>(
+        l,
+        component,
+        |name| lookup(Interface::CliStdin, name),
+        |x| WasiCtxNamedView(x),
+    )?;
+    cli::stdout::add_to_linker::<T, WasiCliNamed<T>>(
+        l,
+        component,
+        |name| lookup(Interface::CliStdout, name),
+        |x| WasiCtxNamedView(x),
+    )?;
+    cli::stderr::add_to_linker::<T, WasiCliNamed<T>>(
+        l,
+        component,
+        |name| lookup(Interface::CliStderr, name),
+        |x| WasiCtxNamedView(x),
+    )?;
+    Ok(())
+}
+
 /// Add all WASI interfaces from this crate into the `linker` provided.
 ///
 /// This function will add the synchronous variant of all interfaces into the

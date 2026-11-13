@@ -17,6 +17,12 @@ use wasmtime::component::Component;
 /// Whether or not WASIp3 is enabled by default.
 pub const P3_DEFAULT: bool = cfg!(feature = "component-model-async");
 
+/// The [`NamedId`](wasmtime_wasi::NamedId) given to every labelled WASI import.
+///
+/// The CLI has a single WASI context, so all labels are bound to it and
+/// [`wasmtime_wasi::WasiNamedView::ctx`] ignores this value.
+pub const DEFAULT_NAMED_ID: wasmtime_wasi::NamedId = wasmtime_wasi::NamedId(0);
+
 #[derive(Clone)]
 pub enum RunTarget {
     Core(Module),
@@ -503,6 +509,112 @@ impl RunCommon {
             let p3_options = wasmtime_wasi::p3::bindings::LinkOptions::default();
             wasmtime_wasi::p3::add_to_linker_with_options(linker, &p3_options)
                 .context("failed to link `wasi:cli@0.3.x`")?;
+        }
+
+        Ok(())
+    }
+
+    /// Adds `wasmtime-wasi` interfaces to `linker` for imports of the
+    /// `component` provided which are labelled with `(implements "...")`.
+    ///
+    /// This is the named-import analogue of [`Self::add_wasmtime_wasi_to_linker`].
+    /// Every labelled import is bound to the default context, as the CLI has no
+    /// way to configure a context per label. Unlabelled imports are left to
+    /// [`Self::add_wasmtime_wasi_to_linker`].
+    ///
+    /// `proxy_only` restricts this to the interfaces of the `wasi:http/proxy`
+    /// world, which is what `wasmtime serve` provides by default.
+    ///
+    /// This does nothing unless `-Snamed-imports` is enabled.
+    #[cfg(all(feature = "component-model", any(feature = "run", feature = "serve")))]
+    pub fn add_named_wasmtime_wasi_to_linker<T>(
+        &self,
+        linker: &mut wasmtime::component::Linker<T>,
+        component: &Component,
+        proxy_only: bool,
+    ) -> Result<()>
+    where
+        T: wasmtime_wasi::WasiNamedView,
+    {
+        if self.common.wasi.named_imports != Some(true) {
+            return Ok(());
+        }
+
+        // The CLI cannot distinguish labels, so every label maps to the same
+        // id and thus the same (default) context.
+        let lookup = |_: wasmtime_wasi::p2::Interface, _: &str| Ok(DEFAULT_NAMED_ID);
+
+        let mut p2_options = wasmtime_wasi::p2::bindings::LinkOptions::default();
+        p2_options.network_error_code(self.common.wasi.network_error_code.unwrap_or(false));
+        if proxy_only {
+            wasmtime_wasi::p2::add_named_to_linker_proxy_interfaces_async(
+                linker,
+                component,
+                lookup,
+            )?;
+        } else {
+            wasmtime_wasi::p2::add_named_to_linker_with_options_async(
+                linker,
+                &p2_options,
+                component,
+                lookup,
+            )?;
+        }
+
+        #[cfg(feature = "component-model-async")]
+        if self.common.wasi.p3.unwrap_or(P3_DEFAULT) {
+            let p3_options = wasmtime_wasi::p3::bindings::LinkOptions::default();
+            if proxy_only {
+                wasmtime_wasi::p3::add_named_to_linker_proxy_interfaces(
+                    linker,
+                    component,
+                    |_: wasmtime_wasi::p3::Interface, _: &str| Ok(DEFAULT_NAMED_ID),
+                )?;
+            } else {
+                wasmtime_wasi::p3::add_named_to_linker_with_options(
+                    linker,
+                    &p3_options,
+                    component,
+                    |_: wasmtime_wasi::p3::Interface, _: &str| Ok(DEFAULT_NAMED_ID),
+                )
+                .context("failed to link labelled `wasi:cli@0.3.x`")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Adds `wasi:http` interfaces to `linker` for imports of the `component`
+    /// provided which are labelled with `(implements "...")`.
+    ///
+    /// This is the named-import analogue of the `wasmtime_wasi_http` functions
+    /// which add unlabelled imports. As with
+    /// [`Self::add_named_wasmtime_wasi_to_linker`] every label is bound to the
+    /// default HTTP context.
+    ///
+    /// This does nothing unless `-Snamed-imports` is enabled.
+    #[cfg(all(feature = "wasi-http", feature = "component-model"))]
+    pub fn add_named_wasmtime_wasi_http_to_linker<T>(
+        &self,
+        linker: &mut wasmtime::component::Linker<T>,
+        component: &Component,
+    ) -> Result<()>
+    where
+        T: wasmtime_wasi_http::WasiHttpNamedView,
+    {
+        if self.common.wasi.named_imports != Some(true) {
+            return Ok(());
+        }
+
+        wasmtime_wasi_http::p2::add_named_to_linker_async(linker, component, |_, _| {
+            Ok(DEFAULT_NAMED_ID)
+        })?;
+
+        #[cfg(feature = "component-model-async")]
+        if self.common.wasi.p3.unwrap_or(P3_DEFAULT) {
+            wasmtime_wasi_http::p3::add_named_to_linker(linker, component, |_, _| {
+                Ok(DEFAULT_NAMED_ID)
+            })?;
         }
 
         Ok(())
