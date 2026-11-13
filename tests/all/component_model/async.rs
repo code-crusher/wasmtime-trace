@@ -2768,8 +2768,21 @@ fn sync_call_async_typed() -> Result<()> {
         );
     }
 
-    // Somehow this shouldn't hit `bail-bug!` at least...
-    const WAT2: &str = r#"
+    Ok(())
+}
+
+/// A sync-lifted export whose body calls an async-lifted (canon-lowered)
+/// import cannot be run through the synchronous `Func::call`: blocking the
+/// caller requires an event loop to resume it, and a sync entrypoint never
+/// runs one.
+///
+/// This is a regression test for
+/// https://github.com/bytecodealliance/wasmtime/issues/14950, which reported
+/// that this case hit a `bail_bug!` panic.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn sync_call_async_callee() -> Result<()> {
+    const WAT: &str = r#"
 (component
   (component $inner
     (core module $m
@@ -2789,11 +2802,28 @@ fn sync_call_async_typed() -> Result<()> {
     (canon lift (core func $i "run")))
 )
 "#;
-    let component = Component::new(&engine, WAT2)?;
+    let engine = Engine::default();
+    let component = Component::new(&engine, WAT)?;
     let mut store = Store::new(&engine, ());
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
     let func = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "run")?;
-    let _ = func.call(&mut store, (4,));
+
+    // The component works fine with an async-style entrypoint, proving it is
+    // valid and only the synchronous entrypoint is unsupported.  Note that
+    // this must run before the failing `call` below, which poisons the store.
+    let (result,) = func.call_async(&mut store, (4,)).await?;
+    assert_eq!(result, 7);
+
+    // The export itself is sync-lifted, so `call` enters the guest before the
+    // latter calls the async-lifted import and discovers there is no event
+    // loop to resume it.  The result is a graceful error rather than the
+    // `bail_bug!` panic this used to trigger.
+    let error = func.call(&mut store, (4,)).unwrap_err();
+    assert!(
+        format!("{error:?}")
+            .contains("async function started during an original synchronous entrypoint"),
+        "unexpected error: {error:?}"
+    );
 
     Ok(())
 }

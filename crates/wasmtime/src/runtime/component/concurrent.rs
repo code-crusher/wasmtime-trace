@@ -3586,10 +3586,17 @@ impl Instance {
         let guest_thread = store.0.current_guest_thread()?;
         let state = store.0.concurrent_state_mut()?;
 
-        // FIXME(#14950): this in theory should be a `bail_bug!`, but this can
-        // be hit through `Func::call` for example. This isn't great because it
-        // means that `Func::call` is sort of fundamentally incompatible with
-        // component-model-async...
+        // Blocking this call requires an event loop to resume the caller's
+        // fiber once the subtask completes, so a synchronous entrypoint (i.e.
+        // `Func::call`, which never runs the event loop) cannot support
+        // guest-to-guest calls that use the async ABI.  Note that this
+        // situation is not detectable before entering the guest: the export
+        // itself may be sync-lifted, and only its body calls an async-lowered
+        // or async-lifted import.
+        //
+        // This used to be a `bail_bug!` until #14950 reported that it was
+        // reachable through `Func::call`; now it returns a graceful error
+        // telling the embedder to use an async-style entrypoint instead.
         if !state.event_loop_running {
             bail!(
                 "async function started during an original synchronous \
