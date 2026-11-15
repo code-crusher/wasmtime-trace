@@ -48,6 +48,12 @@ pub(crate) struct FreeList {
 const ALIGN_U32: u32 = 16;
 const ALIGN_USIZE: usize = ALIGN_U32 as usize;
 
+/// The first index in the GC heap that is available for allocation.
+///
+/// The `ALIGN_U32` bytes before this are reserved so that the index 0 is
+/// never handed out (0 is the "null pointer" encoding).
+pub(crate) const HEAP_START: u32 = ALIGN_U32;
+
 impl FreeList {
     /// Create a new `Layout` from the given `size` with an alignment that is
     /// compatible with this free list.
@@ -495,6 +501,34 @@ impl FreeList {
             .iter()
             .map(|(idx, len)| (*idx, *len))
             .chain(bump)
+    }
+
+    /// Get all free blocks as a vector of `(index, len)` pairs, sorted by
+    /// index.
+    ///
+    /// This is like [`Self::iter_free_blocks`] but with the current bump
+    /// region merged into its sorted position. The heap-walking developer
+    /// tools need the sorted complement of the free list to find the
+    /// allocated objects.
+    pub fn sorted_free_blocks(&self) -> alloc::vec::Vec<(u32, u32)> {
+        let mut blocks = alloc::vec::Vec::with_capacity(self.free_block_index_to_len.len() + 1);
+        blocks.extend(self.free_block_index_to_len.iter().map(|(i, len)| (*i, *len)));
+
+        // Merge the bump region into its sorted position.
+        if self.bump_end > self.bump_ptr {
+            let bump = (self.bump_ptr, self.bump_end - self.bump_ptr);
+            match blocks.binary_search_by(|(i, _)| i.cmp(&bump.0)) {
+                // Note that the free-block invariants guarantee that the bump
+                // region never overlaps any other free block, but it can be
+                // *adjacent* to one, in which case we don't need to merge the
+                // lengths: the complement walk below only relies on disjoint,
+                // sorted ranges.
+                Ok(_) => unreachable!("bump region overlaps a free block"),
+                Err(i) => blocks.insert(i, bump),
+            }
+        }
+
+        blocks
     }
 
     /// Insert a free block into the sorted blocks list with merging.

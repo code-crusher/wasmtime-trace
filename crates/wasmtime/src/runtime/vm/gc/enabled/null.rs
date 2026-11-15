@@ -10,12 +10,12 @@ use crate::{
     prelude::*,
     vm::{
         ExternRefHostDataId, GarbageCollection, GcHeap, GcHeapObject, GcProgress, GcRootsIter,
-        GcRuntime, GcStoreTraceState, SendSyncUnsafeCell, TypedGcRef, VMGcHeader, VMGcRef,
-        VMMemoryDefinition, VMNullHeapData,
+        GcRuntime, GcStoreTraceState, RawGcHeapObjectInfo, SendSyncUnsafeCell, TypedGcRef,
+        VMGcHeader, VMGcRef, VMMemoryDefinition, VMNullHeapData,
     },
 };
 use core::ptr::NonNull;
-use core::{alloc::Layout, any::Any, num::NonZeroU32};
+use core::{alloc::Layout, any::Any, mem, num::NonZeroU32};
 use wasmtime_environ::{
     GcArrayLayout, GcStructLayout, GcTypeLayouts, VMGcKind, VMSharedTypeIndex,
     null::NullTypeLayouts,
@@ -373,6 +373,29 @@ unsafe impl GcHeap for NullHeap {
         usize::try_from(next.get()).unwrap() - 1
     }
 
+    fn iter_heap_objects(
+        &self,
+    ) -> Box<dyn Iterator<Item = crate::Result<RawGcHeapObjectInfo>> + '_> {
+        // The null collector never frees anything, so every object ever
+        // allocated is still in `[1, next)`, one after another. Each object's
+        // header records its size in its reserved bits, and the bump pointer
+        // was advanced to `aligned + size` when the object was allocated.
+        //
+        // Note that the first object is not necessarily at index 1: `alloc`
+        // rounds the bump pointer up to each object's requested alignment
+        // first. However, all objects' headers are `VMGcHeader`-aligned
+        // (8-byte), and the header's `kind` bits are never zero, so the walk
+        // can simply skip any leading index whose header reads as zero: those
+        // bytes are alignment padding, not an object.
+        let end = unsafe { (*self.vmctx_data.get()).next.get() };
+        let walk = NullHeapWalk {
+            heap: self,
+            pos: 1,
+            end,
+        };
+        Box::new(walk)
+    }
+
     fn gc<'a, 'b>(
         &'a mut self,
         _roots: GcRootsIter<'a>,
@@ -392,6 +415,70 @@ unsafe impl GcHeap for NullHeap {
 }
 
 struct NullCollection {}
+
+/// An iterator over the objects allocated in a `NullHeap`.
+///
+/// Every object in the null collector is laid out consecutively from the
+/// start of the heap, and each object's size is recorded in its header's
+/// reserved bits, so walking the heap is just a linear scan from the heap's
+/// start to the current bump-allocation finger.
+struct NullHeapWalk<'a> {
+    /// The heap we are walking.
+    heap: &'a NullHeap,
+
+    /// The index of the next object to visit, or `end` when the walk is done.
+    pos: u32,
+
+    /// One past the last object's end: the current bump-allocation finger.
+    end: u32,
+}
+
+impl Iterator for NullHeapWalk<'_> {
+    type Item = crate::Result<RawGcHeapObjectInfo>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.end {
+            return None;
+        }
+
+        let index = self.pos;
+        let header_size = u32::try_from(mem::size_of::<VMGcHeader>()).unwrap();
+
+        // Read the object's header directly out of the heap's raw bytes.
+        let start = usize::try_from(index).unwrap();
+        let slice = match self
+            .heap
+            .heap_slice()
+            .get(start..)
+            .and_then(|s| s.get(..header_size as usize))
+        {
+            Some(s) => s,
+            None => {
+                return Some(Err(crate::bug!(
+                    "GC heap walk: object header out of bounds at index {index}",
+                ).into()));
+            }
+        };
+
+        // Safety: `slice` is a `VMGcHeader`-sized byte sequence at the start
+        // of this object. All null-collector objects are at least
+        // `VM_GC_HEADER_ALIGN`-aligned, so this is an aligned read in a
+        // non-corrupt heap.
+        let header = unsafe { core::ptr::read_unaligned(slice.as_ptr().cast::<VMGcHeader>()) };
+
+        // The null collector records the object's size in the header's
+        // reserved bits.
+        let size = header.reserved_u26();
+        if size < header_size || index.checked_add(size).is_none() {
+            return Some(Err(crate::bug!(
+                "GC heap walk: invalid object size {size} at index {index}",
+            ).into()));
+        }
+
+        self.pos = index.checked_add(size).unwrap();
+        Some(Ok(RawGcHeapObjectInfo { index, size, header }))
+    }
+}
 
 impl GarbageCollection for NullCollection {
     fn collect_increment(&mut self) -> Result<GcProgress> {

@@ -45,14 +45,14 @@
 //! <https://openresearch-repository.anu.edu.au/bitstream/1885/42030/2/hon-thesis.pdf>
 
 use super::VMArrayRef;
-use super::free_list::FreeList;
+use super::free_list::{FreeList, HEAP_START};
 use super::is_poisoned;
 use super::trace_infos::TraceInfos;
 use crate::hash_set::HashSet;
 use crate::runtime::vm::{
     ExternRefHostDataId, GarbageCollection, GcHeap, GcHeapObject, GcProgress, GcRootsIter,
-    GcRuntime, GcStoreTraceState, SendSyncUnsafeCell, TraceInfo, TypedGcRef, VMExternRef,
-    VMGcHeader, VMGcObjectData, VMGcRef,
+    GcRuntime, GcStoreTraceState, RawGcHeapObjectInfo, SendSyncUnsafeCell, TraceInfo,
+    TypedGcRef, VMExternRef, VMGcHeader, VMGcObjectData, VMGcRef,
 };
 use crate::vm::{VMDrcHeader, VMDrcHeapData, VMMemoryDefinition};
 use crate::{Engine, Trap, bail_bug, prelude::*};
@@ -1167,6 +1167,36 @@ unsafe impl GcHeap for DrcHeap {
         self.allocated_bytes
     }
 
+    fn iter_heap_objects(
+        &self,
+    ) -> Box<dyn Iterator<Item = crate::Result<RawGcHeapObjectInfo>> + '_> {
+        // The DRC collector's heap is not compacted and objects are not
+        // allocated in address order, so the set of allocated objects cannot
+        // be found with a simple linear scan. Instead, walk the free list's
+        // complement: everything within `[HEAP_START, heap_len)` that is not
+        // part of a free block (the bump region included) is part of some
+        // allocated object.
+        //
+        // A detached heap has no objects, and its free list is torn down, so
+        // there is nothing to walk.
+        let walk = match self.free_list.as_ref() {
+            None => {
+                return Box::new(core::iter::empty());
+            }
+            Some(free_list) => DrcHeapWalk {
+                heap: self,
+                free: free_list.sorted_free_blocks(),
+                // The first `HEAP_START` bytes of the heap are reserved for
+                // the "null" index and are never part of any free block, so
+                // the walk starts there.
+                gap_start: HEAP_START,
+                gap_end: HEAP_START,
+                heap_len: u32::try_from(self.heap_slice().len()).unwrap_or(u32::MAX),
+            },
+        };
+        Box::new(walk)
+    }
+
     fn gc<'a, 'b>(
         &'a mut self,
         roots: GcRootsIter<'a>,
@@ -1287,6 +1317,148 @@ impl GarbageCollection for DrcCollection<'_, '_> {
             }
             DrcCollectionPhase::Done => Ok(GcProgress::Complete),
         }
+    }
+}
+
+/// An iterator over the objects allocated in a `DrcHeap`.
+///
+/// The DRC collector's heap is not compacted, and objects are allocated out
+/// of a free list rather than bump-allocated, so the objects cannot be found
+/// with a simple linear scan. Instead, the walk takes the complement of the
+/// free list (including the current bump region) within `[HEAP_START,
+/// heap_len)`: every byte not covered by a free block is part of some
+/// allocated object. Within each such gap, objects are laid out
+/// end-to-end, each occupying a chunk of `FreeList::aligned_size` bytes.
+struct DrcHeapWalk<'a> {
+    /// The heap we are walking.
+    heap: &'a DrcHeap,
+
+    /// The heap's free blocks, sorted by index. These are the regions of the
+    /// heap that do *not* contain objects.
+    free: Vec<(u32, u32)>,
+
+    /// The bounds of the current gap between free blocks that we are walking
+    /// objects within.
+    ///
+    /// When `gap_start >= gap_end`, we need to pull the next free block off
+    /// of `free` and find the next gap.
+    gap_start: u32,
+    gap_end: u32,
+
+    /// The end of the walk: the last byte of the heap.
+    heap_len: u32,
+}
+
+impl<'a> DrcHeapWalk<'a> {
+    /// Find the next gap of allocated-but-not-freed bytes in the heap, if
+    /// any.
+    ///
+    /// Gaps are the complement of the free blocks, in order. The walk is done
+    /// once we've consumed all the free blocks and walked the final trailing
+    /// gap.
+    fn find_next_gap(&mut self) -> bool {
+        // If the previous gap still has bytes left in it, keep walking it.
+        if self.gap_start < self.gap_end {
+            return true;
+        }
+
+        // The last free block (or the start of the heap itself) has left us
+        // positioned at `gap_start`. Either the next free block starts a gap
+        // here, or there is a gap before it.
+        while let Some(&(index, len)) = self.free.first() {
+            let block_end = index.checked_add(len).unwrap();
+
+            // Clamp free blocks to the heap: the free list can track
+            // capacity that is beyond `heap_slice().len()` (e.g. when the
+            // underlying memory is rounded up to page granularity) and we
+            // must not report objects out of bounds.
+            if index >= self.heap_len {
+                self.free.clear();
+                break;
+            }
+            let block_end = block_end.min(self.heap_len);
+
+            if self.gap_start < index {
+                // There is a gap between our position and this free block:
+                // walk it.
+                self.gap_end = index;
+                return true;
+            }
+
+            // No gap before this free block; skip past it.
+            self.gap_start = block_end;
+            self.free.remove(0);
+        }
+
+        // All free blocks are consumed. The final gap is whatever is left
+        // between our position and the end of the heap.
+        if self.gap_start < self.heap_len {
+            self.gap_end = self.heap_len;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Iterator for DrcHeapWalk<'_> {
+    type Item = crate::Result<RawGcHeapObjectInfo>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.find_next_gap() {
+            return None;
+        }
+
+        debug_assert!(self.gap_start < self.gap_end);
+        let index = self.gap_start;
+
+        // Read the object's `VMDrcHeader` to get its header and size.
+        //
+        // Safety: this object is within the heap (as `find_next_gap` only
+        // produces gaps within `heap_slice().len()`), and `VMDrcHeader` is the
+        // common prefix of every DRC-allocated object. The ref is aligned, as
+        // all free-list chunk starts are `ALIGN`-aligned.
+        let drc_header = unsafe {
+            core::ptr::read_unaligned(
+                self.heap
+                    .heap_slice()
+                    .get(index as usize..)
+                    .unwrap()
+                    .as_ptr()
+                    .cast::<VMDrcHeader>(),
+            )
+        };
+
+        // DRC objects occupy whole free-list chunks: their allocation's size
+        // is the object's size rounded up to the free list's alignment.
+        let object_size = drc_header.object_size;
+        let alloc_size = match FreeList::aligned_size(object_size) {
+            Some(size) => size,
+            None => {
+                return Some(Err(crate::bug!(
+                    "GC heap walk: object size overflow at heap index {index}",
+                ).into()));
+            }
+        };
+
+        if object_size == 0
+            || alloc_size < u32::try_from(mem::size_of::<VMDrcHeader>()).unwrap()
+            || index.checked_add(alloc_size).is_none()
+        {
+            return Some(Err(crate::bug!(
+                "GC heap walk: invalid object size {object_size} at heap index {index}",
+            ).into()));
+        }
+
+        // Advance to the next object within this gap, or past the gap's end
+        // if this was the last object in it.
+        self.gap_start = index + alloc_size;
+
+        Some(Ok(RawGcHeapObjectInfo {
+            index,
+            size: object_size,
+            header: drc_header.header,
+        }))
     }
 }
 

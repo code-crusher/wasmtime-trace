@@ -43,6 +43,27 @@ pub unsafe trait GcRuntime: 'static + Send + Sync {
     fn new_gc_heap(&self, engine: &crate::Engine) -> Result<Box<dyn GcHeap>>;
 }
 
+/// A description of one object currently allocated in a GC heap, as produced
+/// by a collector's heap walk.
+///
+/// This is an internal, engine-less representation. The public, embedder-facing
+/// version of this type -- which resolves `kind` into concrete
+/// [`StructType`][crate::StructType]s, [`ArrayType`][crate::ArrayType]s, and
+/// etc -- is produced by [`Store::gc_heap_objects`][crate::Store::gc_heap_objects].
+#[derive(Clone, Copy, Debug)]
+pub struct RawGcHeapObjectInfo {
+    /// This object's index into the GC heap, i.e. the same value as the raw
+    /// `u32` representation of a `VMGcRef` pointing to this object.
+    pub index: u32,
+
+    /// The size of this object in bytes, not including any padding or
+    /// alignment slack that the collector added around it.
+    pub size: u32,
+
+    /// This object's header.
+    pub header: VMGcHeader,
+}
+
 /// A heap that manages garbage-collected objects.
 ///
 /// Each `wasmtime::Store` is associated with a single `GcHeap`, and a `GcHeap`
@@ -386,6 +407,33 @@ pub unsafe trait GcHeap: 'static + Send + Sync {
     /// Defaults to `false`.
     fn needs_gc_before_next_growth(&self) -> bool {
         false
+    }
+
+    /// Iterate over every object currently allocated in this heap, in heap
+    /// order (increasing heap index).
+    ///
+    /// This is a developer tool for profiling and debugging: it is the
+    /// foundation for taking a census of the heap (e.g. "what is taking up
+    /// all this space?"), for diffing the heap before and after some
+    /// operation to find unintended retentions, and for building heap
+    /// snapshots.
+    ///
+    /// The default implementation returns an empty iterator. Collectors
+    /// override this with a walk over their own in-heap allocation
+    /// metadata.
+    ///
+    /// This must only be called while the heap is quiescent: no Wasm is
+    /// executing and no collection is in progress. This is guaranteed by
+    /// the safe, public wrapper,
+    /// [`Store::gc_heap_objects`][crate::Store::gc_heap_objects], which
+    /// requires exclusive access to the store.
+    ///
+    /// Note that objects that are unreachable garbage but have not yet been
+    /// reclaimed by a collection are still reported by this iterator. Run a
+    /// collection first (e.g. via [`Store::gc`][crate::Store::gc]) if you
+    /// want a census of only the live objects.
+    fn iter_heap_objects(&self) -> Box<dyn Iterator<Item = Result<RawGcHeapObjectInfo>> + '_> {
+        Box::new(core::iter::empty())
     }
 
     /// Start a new garbage collection process.

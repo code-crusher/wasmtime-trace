@@ -13,8 +13,8 @@ use crate::vm::{
     SendSyncPtr, StoreGcHostAllocTypes, TraceInfo, VMGcRef,
 };
 use crate::{
-    Engine, ExnRef, GcHeapOutOfMemory, Result, Rooted, Store, StoreContextMut, Tag,
-    ThrownException, bail,
+    ArrayType, Engine, ExnRef, ExnType, GcHeapOutOfMemory, Result, Rooted, Store, StoreContextMut,
+    StructType, Tag, ThrownException, bail,
 };
 use core::fmt;
 use core::mem::ManuallyDrop;
@@ -23,6 +23,53 @@ use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 use wasmtime_environ::DefinedTagIndex;
 use wasmtime_environ::packed_option::ReservedValue;
+
+/// The kind of a GC heap object, as reported by
+/// [`Store::gc_heap_objects`][crate::Store::gc_heap_objects].
+///
+/// Concrete Wasm-defined types (structs, arrays, and exceptions with
+/// user-declared types) also carry their resolved
+/// [`StructType`][crate::StructType], [`ArrayType`][crate::ArrayType], or
+/// [`ExnType`][crate::ExnType] in the corresponding variant.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum GcHeapObjectKind {
+    /// An `externref` wrapping host data.
+    Extern,
+    /// An `anyref`.
+    Any,
+    /// An `eqref`.
+    Eq,
+    /// An `arrayref` of the given Wasm-defined array type.
+    Array(ArrayType),
+    /// A `structref` of the given Wasm-defined struct type.
+    Struct(StructType),
+    /// An `exnref` of the given Wasm-defined exception type.
+    Exn(ExnType),
+}
+
+/// A description of one object currently allocated in the store's GC heap, as
+/// reported by [`Store::gc_heap_objects`][crate::Store::gc_heap_objects].
+#[derive(Clone, Debug)]
+pub struct GcHeapObjectInfo {
+    /// This object's index into the GC heap.
+    ///
+    /// This has no meaning beyond a single store's heap and a single point in
+    /// time, and it is not stable across garbage collections (the copying
+    /// collector moves objects, for example), but it can be useful for
+    /// debugging: for example, it can identify whether the "same" object is
+    /// still present in a later census taken before a collection moves it.
+    pub index: u32,
+
+    /// The size of this object in bytes, including its header but not
+    /// including any padding or alignment slack that the collector added
+    /// around it.
+    pub size: u32,
+
+    /// This object's kind, with its Wasm-defined type resolved, if it has
+    /// one.
+    pub kind: GcHeapObjectKind,
+}
 
 #[derive(Default)]
 pub(crate) struct StoreGcData {
@@ -125,6 +172,39 @@ impl<T> Store<T> {
         StoreContextMut(&mut self.inner).gc_heap_grow(bytes)
     }
 
+    /// Iterate over the objects currently allocated in this store's GC heap.
+    ///
+    /// This is a developer tool for profiling and debugging the GC heap: it
+    /// answers questions like "what objects are taking up space in the heap
+    /// and what are their types?", which is the foundation for building heap
+    /// censuses, snapshot diffing ("what is unintentionally retained between
+    /// two points in time?"), and similar analyses on top. See issue #14615.
+    ///
+    /// The returned iterator yields one [`GcHeapObjectInfo`] per object in the
+    /// GC heap, in no particular order.
+    ///
+    /// Note that objects that are unreachable garbage but that have not been
+    /// reclaimed by a collection yet are still reported by this method. Run a
+    /// collection first (e.g. with [`Store::gc`]) if you want a census of only
+    /// the live objects. The null collector (see
+    /// [`Config::collector`][crate::Config::collector]) never frees anything,
+    /// so every object ever allocated is always reported when it is in use.
+    ///
+    /// This method requires exclusive access to the store, which guarantees
+    /// that the heap is quiescent: no Wasm is executing and no collection is
+    /// in progress while the heap is being walked.
+    ///
+    /// If the GC heap has not been initialized yet (no GC objects have been
+    /// allocated), this yields no objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the GC heap is found to be internally inconsistent,
+    /// which would indicate a bug in Wasmtime.
+    pub fn gc_heap_objects(&mut self) -> Result<impl Iterator<Item = Result<GcHeapObjectInfo>> + '_> {
+        self.inner.gc_heap_objects()
+    }
+
     /// Set an exception as the currently pending exception, and
     /// return an error that propagates the throw.
     ///
@@ -204,6 +284,16 @@ impl<'a, T> StoreContextMut<'a, T> {
         vm::assert_ready(store.grow_gc_heap(limiter.as_mut(), bytes, crate::store::Asyncness::No))
     }
 
+    /// Iterate over the objects currently allocated in this store's GC heap.
+    ///
+    /// For more information, see the documentation of
+    /// [`Store::gc_heap_objects`].
+    pub fn gc_heap_objects(
+        &mut self,
+    ) -> Result<impl Iterator<Item = Result<GcHeapObjectInfo>> + '_> {
+        self.0.inner.gc_heap_objects()
+    }
+
     /// Set an exception as the currently pending exception, and
     /// return an error that propagates the throw.
     ///
@@ -223,6 +313,57 @@ impl<'a, T> StoreContextMut<'a, T> {
     }
 }
 
+/// Resolve an object's raw header into a public [`GcHeapObjectKind`], using the
+/// engine to look up the Wasm-defined type, if the object has one.
+///
+/// The header's `VMGcKind` bits are written by the collectors themselves when
+/// allocating an object, and its type index is either `None` (only for
+/// `externref`s, which have no Wasm-defined type) or the index of a registered
+/// type (objects keep their registered types alive), so both are trusted here.
+fn resolve_gc_heap_object_kind(
+    engine: &Engine,
+    header: crate::vm::VMGcHeader,
+) -> Result<GcHeapObjectKind> {
+    // Note: these use `RegisteredType::try_root`, and therefore root the
+    // resolved types in the engine for the lifetime of the resulting
+    // `GcHeapObjectInfo`. Registered types are kept alive by their modules
+    // regardless, but rooting keeps that true even for host-created types
+    // whose registration would otherwise be droppable.
+    let index = header.ty();
+    let kind = match header.kind() {
+        None => bail!("GC heap object with an invalid kind"),
+        Some(kind) => kind,
+    };
+    match (kind, index) {
+        (wasmtime_environ::VMGcKind::ExternRef, _) => Ok(GcHeapObjectKind::Extern),
+        (wasmtime_environ::VMGcKind::AnyRef, _) => Ok(GcHeapObjectKind::Any),
+        (wasmtime_environ::VMGcKind::EqRef, _) => Ok(GcHeapObjectKind::Eq),
+        (wasmtime_environ::VMGcKind::ArrayRef, Some(index)) => Ok(GcHeapObjectKind::Array(
+            ArrayType::from_shared_type_index(engine, index)
+                .ok_or_else(|| crate::Error::msg("GC heap object with a non-array type index"))?,
+        )),
+        (wasmtime_environ::VMGcKind::StructRef, Some(index)) => Ok(GcHeapObjectKind::Struct(
+            StructType::from_shared_type_index(engine, index)
+                .ok_or_else(|| crate::Error::msg("GC heap object with a non-struct type index"))?,
+        )),
+        (wasmtime_environ::VMGcKind::ExnRef, Some(index)) => Ok(GcHeapObjectKind::Exn(
+            ExnType::from_shared_type_index(engine, index)
+                .ok_or_else(|| crate::Error::msg("GC heap object with a non-exn type index"))?,
+        )),
+        (
+            wasmtime_environ::VMGcKind::ArrayRef
+            | wasmtime_environ::VMGcKind::StructRef
+            | wasmtime_environ::VMGcKind::ExnRef,
+            None,
+        ) => {
+            // An array/struct/exn without a type index cannot happen:
+            // registered types are kept alive by their modules and by their
+            // objects, so an object's type index always resolves.
+            bail!("GC heap object with a missing type index")
+        }
+    }
+}
+
 #[derive(Debug)]
 struct GcHeapGrowthFailed;
 
@@ -235,6 +376,30 @@ impl fmt::Display for GcHeapGrowthFailed {
 impl core::error::Error for GcHeapGrowthFailed {}
 
 impl StoreOpaque {
+    /// Iterate over the objects currently allocated in this store's GC heap.
+    ///
+    /// This is the shared implementation of [`Store::gc_heap_objects`] and
+    /// [`StoreContextMut::gc_heap_objects`].
+    fn gc_heap_objects(&self) -> Result<impl Iterator<Item = Result<GcHeapObjectInfo>> + '_> {
+        let engine = self.engine().clone();
+        let iter = match self.gc_store.as_ref() {
+            None => None,
+            Some(gc_store) => Some(gc_store.gc_heap.iter_heap_objects()),
+        };
+        Ok(iter
+            .into_iter()
+            .flatten()
+            .map(move |object| -> Result<GcHeapObjectInfo> {
+                let object = object?;
+                let kind = resolve_gc_heap_object_kind(&engine, object.header)?;
+                Ok(GcHeapObjectInfo {
+                    index: object.index,
+                    size: object.size,
+                    kind,
+                })
+            }))
+    }
+
     /// Perform any growth or GC needed to allocate `bytes_needed` bytes.
     ///
     /// Note that even when this function returns it is not guaranteed
@@ -1206,7 +1371,10 @@ fn should_collect_first(
 #[cfg(test)]
 mod tests {
     use super::should_collect_first;
-    use crate::{AsContextMut, Config, Engine, ExternRef, Result, Store};
+    use crate::{
+        ArrayRef, AsContextMut, Collector, Config, Engine, ExternRef, GcHeapObjectInfo,
+        GcHeapObjectKind, Instance, Module, Result, Rooted, Store,
+    };
 
     #[test]
     fn test_should_collect_first() {
@@ -1240,7 +1408,7 @@ mod tests {
         assert_eq!(should_collect_first(16, 1024, 64), true);
 
         // Common case: predicted usage is high --> plausible we may not have
-        // enough space, and we want to amortize the cost of collections, so
+        // enough space, and we want to amortize the costs of collections, so
         // grow first.
         assert_eq!(should_collect_first(16, 1024, 512), false);
     }
@@ -1255,6 +1423,150 @@ mod tests {
 
         let gc_store = store.as_context_mut().0.unwrap_gc_store();
         assert_eq!(gc_store.gc_heap_capacity(), 1 << 20);
+        Ok(())
+    }
+
+    /// The Wasm used by the `gc_heap_objects_*` tests: allocate two structs
+    /// and an array holding them, and return the array.
+    const ALLOC_WAT: &str = r#"
+        (module
+            (type $point (struct (field i64) (field i64)))
+            (type $points (array (ref $point)))
+            (func (export "alloc") (result (ref $points))
+                (array.new_fixed $points 2
+                    (struct.new $point (i64.const 1) (i64.const 2))
+                    (struct.new $point (i64.const 3) (i64.const 4))
+                )
+            )
+        )
+    "#;
+
+    /// Collect a census of the store's GC heap into a `Vec`.
+    fn census(mut store: impl crate::AsContextMut<Data = ()>) -> alloc::vec::Vec<GcHeapObjectInfo> {
+        store
+            .as_context_mut()
+            .gc_heap_objects()
+            .unwrap()
+            .collect::<Result<alloc::vec::Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn gc_heap_objects_before_allocation_is_empty() -> Result<()> {
+        let engine = Engine::new(&Config::new())?;
+        let mut store = Store::new(&engine, ());
+        assert!(store.gc_heap_objects()?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn gc_heap_objects_finds_externref() -> Result<()> {
+        for collector in [
+            Collector::Auto,
+            Collector::DeferredReferenceCounting,
+            Collector::Null,
+        ] {
+            eprintln!("collector = {collector:?}");
+            let mut config = Config::new();
+            config.wasm_function_references(true);
+            config.wasm_gc(true);
+            config.collector(collector);
+            let engine = Engine::new(&config)?;
+            let mut store = Store::new(&engine, ());
+
+            // No objects yet.
+            assert!(census(&mut store).is_empty());
+
+            // A rooted `externref` should be found by the census.
+            let mut store = store;
+            {
+                let mut rooted = crate::RootScope::new(&mut store);
+                let _root = ExternRef::new(&mut rooted, 1)?;
+
+                // Take the census inside the rooting scope, where the
+                // `externref` is still live.
+                let objects = census(&mut rooted);
+                assert_eq!(objects.len(), 1, "expected one object, got {objects:?}");
+                assert!(matches!(objects[0].kind, GcHeapObjectKind::Extern));
+            }
+
+            // Once unrooted and collected, the object is gone (except under
+            // the null collector, which never collects).
+            store.gc(None)?;
+            let after_gc = census(&mut store);
+            match collector {
+                Collector::Null => assert_eq!(after_gc.len(), 1),
+                _ => assert!(
+                    after_gc.is_empty(),
+                    "expected an empty heap after GC, got {after_gc:?}",
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gc_heap_objects_finds_wasm_objects() -> Result<()> {
+        for collector in [
+            Collector::Auto,
+            Collector::DeferredReferenceCounting,
+            Collector::Null,
+        ] {
+            let mut config = Config::new();
+            config.wasm_function_references(true);
+            config.wasm_gc(true);
+            config.collector(collector);
+            let engine = Engine::new(&config)?;
+            let mut store = Store::new(&engine, ());
+            let module = Module::new(&engine, ALLOC_WAT)?;
+            let instance = Instance::new(&mut store, &module, &[])?;
+            let func = instance.get_typed_func::<(), Rooted<ArrayRef>>(&mut store, "alloc")?;
+
+            // Call `alloc` and let the returned array fall out of scope: all
+            // of the allocated objects are garbage now.
+            func.call(&mut store, ())?;
+
+            // The census still sees the unreachable garbage before a
+            // collection...
+            let before_gc = census(&mut store);
+            assert!(
+                before_gc.len() >= 3,
+                "expected at least the 2 structs and the array, got {before_gc:?}",
+            );
+
+            // ...and after a collection, only live objects remain (except
+            // under the null collector, which never collects).
+            store.gc(None)?;
+            let after_gc = census(&mut store);
+            match collector {
+                Collector::Null => assert!(after_gc.len() >= 3),
+                _ => assert!(
+                    after_gc.is_empty(),
+                    "expected an empty heap after GC, got {after_gc:?}",
+                ),
+            }
+
+            // Keep the returned array alive with a root: now all three
+            // objects should survive the collection.
+            let _array = func.call(&mut store, ())?;
+            store.gc(None)?;
+            let after_gc = census(&mut store);
+            assert_eq!(
+                after_gc.len(),
+                3,
+                "expected 2 structs and 1 array, got {after_gc:?}",
+            );
+            let n_structs = after_gc
+                .iter()
+                .filter(|o| matches!(o.kind, GcHeapObjectKind::Struct(_)))
+                .count();
+            let n_arrays = after_gc
+                .iter()
+                .filter(|o| matches!(o.kind, GcHeapObjectKind::Array(_)))
+                .count();
+            assert_eq!(n_structs, 2, "expected 2 structs, got {after_gc:?}");
+            assert_eq!(n_arrays, 1, "expected 1 array, got {after_gc:?}");
+        }
         Ok(())
     }
 }

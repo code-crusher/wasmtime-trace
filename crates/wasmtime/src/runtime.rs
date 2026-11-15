@@ -104,6 +104,8 @@ pub use module::{Module, ModuleExport, ModuleFunction};
 pub use resources::*;
 #[cfg(all(feature = "async", feature = "call-hook"))]
 pub use store::CallHookHandler;
+#[cfg(feature = "gc")]
+pub use store::{GcHeapObjectInfo, GcHeapObjectKind};
 pub use store::{
     AsContext, AsContextMut, CallHook, Store, StoreContext, StoreContextMut, StoreHookState,
     UpdateDeadline,

@@ -126,6 +126,8 @@ pub use self::async_::CallHookHandler;
 
 #[cfg(feature = "gc")]
 mod gc;
+#[cfg(feature = "gc")]
+pub use self::gc::{GcHeapObjectInfo, GcHeapObjectKind};
 #[cfg(not(feature = "gc"))]
 mod gc_disabled;
 

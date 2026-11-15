@@ -15,8 +15,9 @@ use super::is_poisoned;
 use super::trace_infos::TraceInfos;
 use crate::runtime::vm::{
     ExternRefHostDataId, GarbageCollection, GcHeap, GcHeapObject, GcProgress, GcRootsIter,
-    GcRuntime, GcStoreTraceState, SendSyncUnsafeCell, TraceInfo, TypedGcRef, VMCopyingHeader,
-    VMCopyingHeapData, VMExternRef, VMGcHeader, VMGcRef, VMMemoryDefinition,
+    GcRuntime, GcStoreTraceState, RawGcHeapObjectInfo, SendSyncUnsafeCell, TraceInfo,
+    TypedGcRef, VMCopyingHeader, VMCopyingHeapData, VMExternRef, VMGcHeader, VMGcRef,
+    VMMemoryDefinition,
 };
 use crate::{Engine, bail_bug, prelude::*};
 use core::{
@@ -948,6 +949,33 @@ unsafe impl GcHeap for CopyingHeap {
         usize::try_from(self.active_space_end() - self.active_space_start).unwrap()
     }
 
+    fn iter_heap_objects(
+        &self,
+    ) -> Box<dyn Iterator<Item = crate::Result<RawGcHeapObjectInfo>> + '_> {
+        // All objects in the copying collector are bump-allocated one after
+        // another in the active semi-space, and each object's
+        // `VMCopyingHeader` records its (already ALIGN-rounded) size, so
+        // walking the heap is just a linear scan of the active semi-space up
+        // to the current bump pointer.
+        //
+        // Note that the first `ALIGN` bytes of the active semi-space are
+        // reserved (when the first semi-space is active, this keeps the
+        // "null" index 0 from ever being handed out; when the second
+        // semi-space is active, this keeps the two semi-spaces equally sized)
+        // so the walk starts after them, just like the bump pointer itself.
+        // See `reset_bump_ptr`.
+        let pos = self
+            .active_space_start
+            .saturating_add(ALIGN)
+            .min(self.bump_ptr());
+        let walk = CopyingHeapWalk {
+            heap: self,
+            pos,
+            end: self.bump_ptr(),
+        };
+        Box::new(walk)
+    }
+
     fn gc<'a, 'b>(
         &'a mut self,
         roots: GcRootsIter<'a>,
@@ -1020,6 +1048,77 @@ unsafe impl GcHeap for CopyingHeap {
 }
 
 const OBJECTS_PER_INCREMENT: usize = 16_384;
+
+/// An iterator over the objects allocated in a `CopyingHeap`.
+///
+/// All objects in the copying collector are laid out consecutively within the
+/// active semi-space, and each object's `VMCopyingHeader` records its size (as
+/// an already-`ALIGN`-rounded multiple of `ALIGN`), so walking the heap is just
+/// a linear scan from the start of the active semi-space to the current bump
+/// pointer.
+struct CopyingHeapWalk<'a> {
+    /// The heap we are walking.
+    heap: &'a CopyingHeap,
+
+    /// The index of the next object to visit, or `end` when the walk is done.
+    pos: u32,
+
+    /// One past the last object's end: the current bump pointer.
+    end: u32,
+}
+
+impl Iterator for CopyingHeapWalk<'_> {
+    type Item = crate::Result<RawGcHeapObjectInfo>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.end {
+            return None;
+        }
+
+        let index = self.pos;
+        let header_size = HEADER_SIZE;
+
+        // Read the object's `VMCopyingHeader` directly out of the heap's raw
+        // bytes.
+        let start = usize::try_from(index).unwrap();
+        let slice = match self
+            .heap
+            .heap_slice()
+            .get(start..)
+            .and_then(|s| s.get(..header_size as usize))
+        {
+            Some(s) => s,
+            None => {
+                return Some(Err(crate::bug!(
+                    "GC heap walk: object header out of bounds at index {index}",
+                ).into()));
+            }
+        };
+
+        // Safety: `slice` is a `VMCopyingHeader`-sized byte sequence at the
+        // start of this object. All copying-collector objects are `ALIGN`
+        // aligned, so this is an aligned read in a non-corrupt heap.
+        let copying_header =
+            unsafe { core::ptr::read_unaligned(slice.as_ptr().cast::<VMCopyingHeader>()) };
+
+        // The copying collector rounds every object's size up to `ALIGN` in
+        // `alloc_raw`, so `object_size` both describes the object's bytes and
+        // is the distance to the next object.
+        let size = copying_header.object_size;
+        if size < header_size || index.checked_add(size).is_none() {
+            return Some(Err(crate::bug!(
+                "GC heap walk: invalid object size {size} at index {index}",
+            ).into()));
+        }
+
+        self.pos = index.checked_add(size).unwrap();
+        Some(Ok(RawGcHeapObjectInfo {
+            index,
+            size,
+            header: copying_header.header,
+        }))
+    }
+}
 
 struct CopyingCollection<'a, 'b> {
     roots: Option<GcRootsIter<'a>>,
