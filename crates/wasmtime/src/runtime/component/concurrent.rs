@@ -974,7 +974,7 @@ pub(crate) fn poll_and_block<R: Send + Sync + 'static>(
             }) as HostTaskFuture;
 
             let caller_instance = store.concurrent_state_mut()?.get_mut(caller.task)?.instance;
-            store.switch_or_trap_if_may_not_suspend(caller_instance)?;
+            store.switch_or_trap_if_may_not_suspend(Some(caller), caller_instance)?;
 
             let state = store.concurrent_state_mut()?;
             state.push_future(future);
@@ -2007,29 +2007,17 @@ impl StoreOpaque {
     fn enter_sync_call(&mut self, callee: RuntimeInstance) -> Result<()> {
         log::trace!("enter sync-typed call {callee:?}");
         let state = self.instance_state(callee).concurrent_state();
-        let old_do_not_suspend = state.do_not_suspend;
-        state.do_not_suspend = true;
-
-        let thread = self.current_guest_thread()?;
-        let thread = self.concurrent_state_mut()?.get_mut(thread.thread)?;
-        if thread.old_do_not_suspend.is_some() {
-            bail_bug!("current thread already has `old_do_not_suspend` value");
-        }
-
-        thread.old_do_not_suspend = Some(old_do_not_suspend);
-
+        state.sync_tasks_in_progress += 1;
         Ok(())
     }
 
     fn exit_sync_call(&mut self, callee: RuntimeInstance) -> Result<()> {
         log::trace!("exit sync-typed call {callee:?}");
-        let thread = self.current_guest_thread()?;
-        let thread = self.concurrent_state_mut()?.get_mut(thread.thread)?;
-        let Some(old_do_not_suspend) = thread.old_do_not_suspend.take() else {
-            bail_bug!("current thread missing `old_do_not_suspend` value");
-        };
         let state = self.instance_state(callee).concurrent_state();
-        state.do_not_suspend = old_do_not_suspend;
+        if state.sync_tasks_in_progress == 0 {
+            bail_bug!("exiting sync-typed call but no sync-typed tasks in progress");
+        }
+        state.sync_tasks_in_progress -= 1;
         Ok(())
     }
 
@@ -2144,7 +2132,7 @@ impl StoreOpaque {
             // resolve any outstanding sync-typed call which might be in
             // progress, so we may need to switch or trap before exiting this
             // thread:
-            self.switch_or_trap_if_may_not_suspend(instance)?;
+            self.switch_or_trap_if_may_not_suspend(None, instance)?;
         }
 
         self.cleanup_thread(thread, instance)?;
@@ -2303,8 +2291,12 @@ impl StoreOpaque {
     }
 
     /// Call `switch_if_may_not_suspend` and trap if it returns `false`.
-    fn switch_or_trap_if_may_not_suspend(&mut self, instance: RuntimeInstance) -> Result<()> {
-        if self.switch_if_may_not_suspend(instance)? {
+    fn switch_or_trap_if_may_not_suspend(
+        &mut self,
+        thread: Option<QualifiedThreadId>,
+        instance: RuntimeInstance,
+    ) -> Result<()> {
+        if self.switch_if_may_not_suspend(thread, instance)? {
             Ok(())
         } else {
             Err(Trap::CannotBlockSyncTask.into())
@@ -2314,20 +2306,39 @@ impl StoreOpaque {
     /// Check if the specified instance has a sync-typed call in progress; if so
     /// attempt to switch to another ready thread for that instance, and if no
     /// such thread exists, return false.
-    fn switch_if_may_not_suspend(&mut self, instance: RuntimeInstance) -> Result<bool> {
+    ///
+    /// The specified `thread` is the thread which is about to suspend, if any.
+    /// If suspending that thread returns control to its caller (see
+    /// `GuestTask::susps_to_caller`), the suspension is permitted even when a
+    /// sync-typed call is in progress for `instance`, since the caller may
+    /// then be able to make progress (or block and trap) itself.
+    fn switch_if_may_not_suspend(
+        &mut self,
+        thread: Option<QualifiedThreadId>,
+        instance: RuntimeInstance,
+    ) -> Result<bool> {
         // Call this for the side effect of forcing any deferred task creation,
-        // which may influence the value of `ConcurrentState::do_not_suspend`
-        // below:
+        // which may influence the value of
+        // `ConcurrentInstanceState::sync_tasks_in_progress` below:
         self.concurrent_state_mut()?;
 
-        Ok(!self.concurrency_support()
-            || !self
-                .instance_state(instance)
-                .concurrent_state()
-                .do_not_suspend
-            || self
-                .concurrent_state_mut()?
-                .promote_instance_local_thread_work_item(instance)?)
+        if !self.concurrency_support() {
+            return Ok(true);
+        }
+
+        let state = self.instance_state(instance).concurrent_state();
+        if state.sync_tasks_in_progress == 0 {
+            return Ok(true);
+        }
+        if let Some(thread) = thread {
+            let task = self.concurrent_state_mut()?.get_mut(thread.task)?;
+            if task.susps_to_caller {
+                return Ok(true);
+            }
+        }
+
+        self.concurrent_state_mut()?
+            .promote_instance_local_thread_work_item(instance)
     }
 
     /// Record that we're about to enter a (sub-)component instance which does
@@ -2600,7 +2611,7 @@ impl StoreOpaque {
         let set = state.get_mut(caller.thread)?.sync_call_set;
         waitable.join(state, Some(set))?;
 
-        self.switch_or_trap_if_may_not_suspend(caller_instance)?;
+        self.switch_or_trap_if_may_not_suspend(Some(caller), caller_instance)?;
 
         self.suspend(SuspendReason::Waiting {
             set,
@@ -2829,7 +2840,8 @@ impl StoreOpaque {
             .any(|instance| {
                 self.instance_state(instance)
                     .concurrent_state()
-                    .do_not_suspend
+                    .sync_tasks_in_progress
+                    > 0
             }))
     }
 }
@@ -2964,7 +2976,7 @@ impl Instance {
                 // won't help resolve any outstanding sync-typed call which
                 // might be in progress, so we may need to switch or trap before
                 // exiting this thread:
-                store.switch_or_trap_if_may_not_suspend(runtime_instance)?;
+                store.switch_or_trap_if_may_not_suspend(None, runtime_instance)?;
 
                 store.cleanup_thread(guest_thread, runtime_instance)?;
             }
@@ -3052,7 +3064,7 @@ impl Instance {
             .concurrent_state_mut()?
             .get_mut(guest_thread.task)?
             .instance;
-        store.switch_or_trap_if_may_not_suspend(instance)?;
+        store.switch_or_trap_if_may_not_suspend(Some(guest_thread), instance)?;
 
         // Register to be woken up when an event is published for this waitable
         // set.
@@ -3300,7 +3312,7 @@ impl Instance {
                     // won't help resolve any outstanding sync-typed call which
                     // might be in progress, so we may need to switch or trap
                     // before exiting this thread:
-                    store.switch_or_trap_if_may_not_suspend(callee_instance)?;
+                    store.switch_or_trap_if_may_not_suspend(None, callee_instance)?;
                 }
 
                 // This is a callback-less call, so the implicit thread has now completed
@@ -3605,7 +3617,6 @@ impl Instance {
 
         let task = state.get_mut(guest_thread.task)?;
         let callee_async_typed = task.async_typed;
-        let callee_instance = task.instance;
 
         task.async_lifted = (flags & START_FLAG_ASYNC_CALLEE) != 0;
 
@@ -3643,20 +3654,15 @@ impl Instance {
             )?;
         }
 
-        let old_do_not_suspend = if callee_async_typed {
+        if callee_async_typed {
             // If we're starting an async-typed call, it is permitted to suspend
             // since that will just return control back to the caller, which may
             // be able to avoid blocking if needed.
             //
-            // We'll restore the old value after the call either returns or
-            // suspends.
-            let state = store.0.instance_state(callee_instance).concurrent_state();
-            let old_do_not_suspend = state.do_not_suspend;
-            state.do_not_suspend = false;
-            Some(old_do_not_suspend)
-        } else {
-            None
-        };
+            // We'll clear the flag once the call either returns or suspends.
+            let state = store.0.concurrent_state_mut()?;
+            state.get_mut(guest_thread.task)?.susps_to_caller = true;
+        }
 
         let state = store.0.concurrent_state_mut()?;
 
@@ -3696,12 +3702,15 @@ impl Instance {
                 SuspendReason::YieldingToSubtask { thread: caller }
             })?;
 
-            if let Some(old_do_not_suspend) = old_do_not_suspend {
+            if callee_async_typed {
+                // The callee's initial run has now either returned or
+                // suspended, so suspending it no longer returns control to us
+                // (i.e. the caller); clear the exemption.
                 store
                     .0
-                    .instance_state(callee_instance)
-                    .concurrent_state()
-                    .do_not_suspend = old_do_not_suspend;
+                    .concurrent_state_mut()?
+                    .get_mut(guest_thread.task)?
+                    .susps_to_caller = false;
             }
 
             let state = store.0.concurrent_state_mut()?;
@@ -3736,7 +3745,9 @@ impl Instance {
                 // The callee hasn't returned yet, and the caller is calling via
                 // a sync-lowered import, so we loop and keep waiting until the
                 // callee returns.
-                store.0.switch_or_trap_if_may_not_suspend(caller_instance)?;
+                store
+                    .0
+                    .switch_or_trap_if_may_not_suspend(Some(caller), caller_instance)?;
             }
         };
 
@@ -4301,7 +4312,7 @@ impl Instance {
                 // or trap if the instance has an outstanding sync-typed call:
                 store
                     .0
-                    .switch_or_trap_if_may_not_suspend(runtime_instance)?;
+                    .switch_or_trap_if_may_not_suspend(None, runtime_instance)?;
 
                 store.0.cleanup_thread(guest_thread, runtime_instance)?;
 
@@ -4474,15 +4485,18 @@ impl Instance {
             SuspensionTarget::None => true,
         };
 
-        if check_suspend && !store.switch_if_may_not_suspend(self.runtime_instance(caller))? {
+        let guest_thread = store.current_guest_thread()?;
+
+        if check_suspend
+            && !store
+                .switch_if_may_not_suspend(Some(guest_thread), self.runtime_instance(caller))?
+        {
             return if yielding {
                 Ok(WaitResult::Completed)
             } else {
                 Err(Trap::CannotBlockSyncTask.into())
             };
         }
-
-        let guest_thread = store.current_guest_thread()?;
 
         let reason = if yielding {
             SuspendReason::Yielding {
@@ -4530,7 +4544,7 @@ impl Instance {
                         break;
                     }
 
-                    store.switch_or_trap_if_may_not_suspend(caller)?;
+                    store.switch_or_trap_if_may_not_suspend(Some(guest_thread), caller)?;
 
                     store.suspend(SuspendReason::Waiting {
                         set,
@@ -4680,13 +4694,11 @@ impl Instance {
                     let thread_mut = concurrent_state.get_mut(thread.thread)?;
 
                     let yield_ = |store: &mut StoreOpaque| {
-                        // While we're yielding, temporarily set
-                        // `do_not_suspend` to false on the subtask's instance
-                        // since we'll be getting control back if it does
-                        // suspend.
-                        let state = store.instance_state(runtime_instance).concurrent_state();
-                        let old_do_not_suspend = state.do_not_suspend;
-                        state.do_not_suspend = false;
+                        // While we're yielding, the subtask is permitted to
+                        // suspend since we'll be getting control back if it
+                        // does.
+                        let state = store.concurrent_state_mut()?;
+                        state.get_mut(guest_task)?.susps_to_caller = true;
 
                         let caller = store.current_guest_thread()?;
 
@@ -4703,10 +4715,7 @@ impl Instance {
                         let state = store.concurrent_state_mut()?;
                         waitable.join(state, None)?;
 
-                        store
-                            .instance_state(runtime_instance)
-                            .concurrent_state()
-                            .do_not_suspend = old_do_not_suspend;
+                        state.get_mut(guest_task)?.susps_to_caller = false;
 
                         Ok::<(), crate::Error>(())
                     };
@@ -5492,9 +5501,6 @@ pub struct GuestThread {
     instance_rep: Option<u32>,
     /// Scratch waitable set used to watch subtasks during synchronous calls.
     sync_call_set: TableId<WaitableSet>,
-    /// The old value of `do_not_suspend` prior to the sync-typed task for which
-    /// this thread was created, if relevant.
-    old_do_not_suspend: Option<bool>,
 }
 
 impl GuestThread {
@@ -5523,7 +5529,6 @@ impl GuestThread {
             state: GuestThreadState::NotStartedImplicit,
             instance_rep: None,
             sync_call_set,
-            old_do_not_suspend: None,
         })
     }
 
@@ -5546,7 +5551,6 @@ impl GuestThread {
             state: GuestThreadState::NotStartedExplicit(start_func),
             instance_rep: None,
             sync_call_set,
-            old_do_not_suspend: None,
         })
     }
 }
@@ -5630,6 +5634,14 @@ pub(crate) struct GuestTask {
     /// Indicates whether this task was created for a call to an async-lifted
     /// export.
     async_lifted: bool,
+    /// Whether suspending this task returns control to its caller rather than
+    /// the event loop.
+    ///
+    /// This is set while a sync caller is waiting for the callee's initial run
+    /// (or a `subtask.cancel`-triggered yield to it), during which time the
+    /// callee is permitted to suspend even if its instance has sync-typed
+    /// tasks in progress.  See `switch_if_may_not_suspend`.
+    susps_to_caller: bool,
     /// Whether `ConcurrentState::interesting_tasks` has been decremented for
     /// this task yet.
     decremented_interesting_task_count: bool,
@@ -5690,6 +5702,7 @@ impl GuestTask {
             threads: HashSet::new(),
             async_typed,
             async_lifted,
+            susps_to_caller: false,
             decremented_interesting_task_count: false,
             group,
             // One for the caller and one for the implicit guest thread we're
@@ -5941,9 +5954,15 @@ pub struct ConcurrentInstanceState {
     backpressure: u16,
     /// Whether this instance can be entered
     do_not_enter: bool,
-    /// Whether this instance may suspend (i.e. whether this instance is
-    /// currently running a sync-typed function).
-    do_not_suspend: bool,
+    /// The number of sync-typed tasks which have started but not yet returned
+    /// for this instance.  While this is greater than zero, the instance may
+    /// not suspend to the event loop.
+    ///
+    /// Note that this is a count rather than a boolean (or a saved-and-restored
+    /// boolean) because sync-typed tasks need not return in LIFO order: one
+    /// may start (and suspend) while another in the same instance is in
+    /// progress, and the two may then return in either order.
+    sync_tasks_in_progress: usize,
     /// Pending calls for this instance which require `Self::backpressure` to be
     /// zero and/or `Self::do_not_enter` to be false before they can proceed.
     pending: BTreeMap<QualifiedThreadId, GuestCallKind>,
@@ -6563,8 +6582,19 @@ impl ConcurrentState {
         self.promote_work_item_matching(|item: &WorkItem| {
             let result = match item {
                 WorkItem::ResumeThread { instance, .. }
-                | WorkItem::ResumeFiber { instance, .. }
-                | WorkItem::GuestCall { instance, .. } => *instance == current_instance,
+                | WorkItem::ResumeFiber { instance, .. } => *instance == current_instance,
+                // Note that `GuestCallKind::StartImplicit` is excluded since,
+                // per the spec, while a sync-typed task is blocked only
+                // threads already registered in its instance may run, and a
+                // task's implicit thread isn't registered until it starts.
+                WorkItem::GuestCall {
+                    instance,
+                    call:
+                        GuestCall {
+                            kind: GuestCallKind::DeliverEvent { .. } | GuestCallKind::StartExplicit(_),
+                            ..
+                        },
+                } => *instance == current_instance,
                 _ => false,
             };
 

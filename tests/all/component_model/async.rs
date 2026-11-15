@@ -3897,3 +3897,67 @@ async fn cancel_stream_read_completed_by_host() -> Result<()> {
         }
     }
 }
+
+/// Regression test for issue #14576: two concurrent, sync-typed calls to the
+/// same instance may interleave via `thread.yield` and return in an order other
+/// than LIFO.  Once both have returned, the instance must no longer be marked
+/// as having a sync-typed task in progress, so a subsequent async-typed call
+/// may yield and exit without trapping.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn concurrent_sync_typed_calls_with_yield() -> Result<()> {
+    let engine = Engine::default();
+    let component = Component::new(
+        &engine,
+        r#"
+(component
+  (core func $thread.yield (canon thread.yield))
+  (core func $task.return (canon task.return))
+  (core module $m
+    (import "" "thread.yield" (func $yield (result i32)))
+    (import "" "task.return" (func $task.return))
+    (global $s1-running (mut i32) (i32.const 0))
+    (func (export "s1")
+      (global.set $s1-running (i32.const 1))
+      (drop (call $yield))
+      (global.set $s1-running (i32.const 0)))
+    (func (export "s2")
+      (if (global.get $s1-running) (then unreachable))
+      (drop (call $yield)))
+    (func (export "noop") (result i32) (call $task.return) (i32.const 0)) ;; EXIT
+    (func (export "cb") (param i32 i32 i32) (result i32) unreachable))
+  (core instance $i (instantiate $m (with "" (instance
+    (export "thread.yield" (func $thread.yield))
+    (export "task.return" (func $task.return))))))
+  (func (export "s1") (canon lift (core func $i "s1")))
+  (func (export "s2") (canon lift (core func $i "s2")))
+  (func (export "noop") async
+    (canon lift (core func $i "noop") async (callback (core func $i "cb"))))
+)
+        "#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine)
+        .instantiate_async(&mut store, &component)
+        .await?;
+    let s1 = instance.get_typed_func::<(), ()>(&mut store, "s1")?;
+    let s2 = instance.get_typed_func::<(), ()>(&mut store, "s2")?;
+    let noop = instance.get_typed_func::<(), ()>(&mut store, "noop")?;
+
+    store
+        .run_concurrent(async |accessor| {
+            tokio::try_join!(
+                s1.call_concurrent(accessor, ()),
+                s2.call_concurrent(accessor, ())
+            )
+        })
+        .await??;
+
+    store
+        .run_concurrent(async |accessor| noop.call_concurrent(accessor, ()).await)
+        .await??;
+
+    store.assert_concurrent_state_empty();
+
+    Ok(())
+}
