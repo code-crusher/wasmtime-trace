@@ -1,3 +1,7 @@
+mod sleep;
+
+pub(crate) use self::sleep::{sleep, sleep_until};
+
 use crate::{NamedId, WasiCtxNamedView};
 use std::error::Error;
 use std::fmt;

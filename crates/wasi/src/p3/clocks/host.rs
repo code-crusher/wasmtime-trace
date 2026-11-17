@@ -1,8 +1,7 @@
-use crate::clocks::WasiClocksCtxView;
+use crate::clocks::{WasiClocksCtxView, sleep};
 use crate::p3::bindings::clocks::{monotonic_clock, system_clock, types};
 use crate::p3::clocks::WasiClocks;
 use core::time::Duration;
-use tokio::time::sleep;
 use wasmtime::component::Accessor;
 
 impl WasiClocksCtxView<'_> {
@@ -66,6 +65,7 @@ impl monotonic_clock::Host for WasiClocksCtxView<'_> {
 }
 
 mod named {
+    use crate::clocks::sleep;
     use crate::clocks::{WasiClocksNamed, WasiClocksNamedView};
     use crate::p3::bindings::clocks::monotonic_clock::Mark;
     use crate::p3::bindings::clocks::system_clock::Instant;
@@ -73,7 +73,6 @@ mod named {
     use crate::p3::bindings::named_imports::wasi::clocks::{monotonic_clock, system_clock};
     use crate::{NamedId, WasiCtxNamedView};
     use core::time::Duration;
-    use tokio::time::sleep;
     use wasmtime::component::Accessor;
 
     impl<T> system_clock::Host for WasiCtxNamedView<'_, T>

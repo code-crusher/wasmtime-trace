@@ -1,4 +1,4 @@
-use crate::clocks::WasiClocksCtxView;
+use crate::clocks::{WasiClocksCtxView, sleep_until};
 use crate::p2::DynPollable;
 use crate::p2::bindings::{
     clocks::monotonic_clock::{self, Duration as WasiDuration, Instant},
@@ -70,11 +70,11 @@ impl wall_clock::Host for WasiClocksCtxView<'_> {
 
 fn subscribe_to_duration(
     table: &mut wasmtime::component::ResourceTable,
-    duration: tokio::time::Duration,
+    duration: Duration,
 ) -> wasmtime::Result<Resource<DynPollable>> {
     let sleep = if duration.is_zero() {
         table.push(Deadline::Past { yielded: false })?
-    } else if let Some(deadline) = tokio::time::Instant::now().checked_add(duration) {
+    } else if let Some(deadline) = std::time::Instant::now().checked_add(duration) {
         // NB: this resource created here is not actually exposed to wasm, it's
         // only an internal implementation detail used to match the signature
         // expected by `subscribe`.
@@ -116,7 +116,7 @@ impl monotonic_clock::Host for WasiClocksCtxView<'_> {
 
 enum Deadline {
     Past { yielded: bool },
-    Instant(tokio::time::Instant),
+    Instant(std::time::Instant),
     Never,
 }
 
@@ -146,7 +146,7 @@ impl Pollable for Deadline {
                 *yielded = true;
                 tokio::task::yield_now().await
             }
-            Deadline::Instant(instant) => tokio::time::sleep_until(*instant).await,
+            Deadline::Instant(instant) => sleep_until(*instant).await,
             Deadline::Never => std::future::pending().await,
         }
     }
@@ -201,5 +201,44 @@ mod named {
         ) -> wasmtime::Result<Resource<DynPollable>> {
             super::monotonic_clock::Host::subscribe_duration(&mut self.0.clocks(id), duration)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies that a deadline pollable resolves with sub-millisecond
+    /// accuracy, i.e. that it isn't limited by Tokio's millisecond timer
+    /// granularity.
+    ///
+    /// A current-thread runtime is used so that the measured overshoot is the
+    /// timer's own, rather than the latency of waking a task on another
+    /// thread.
+    #[tokio::test]
+    async fn deadline_pollable_is_precise() {
+        let duration = Duration::from_micros(1500);
+        let limit = Duration::from_micros(750);
+
+        let mut samples = Vec::new();
+        for _ in 0..21 {
+            let start = std::time::Instant::now();
+            Deadline::Instant(start + duration).ready().await;
+            samples.push(start.elapsed().saturating_sub(duration));
+        }
+
+        samples.sort();
+        let median = samples[samples.len() / 2];
+        assert!(
+            median < limit,
+            "median overshoot of {median:?} exceeds {limit:?}"
+        );
+    }
+
+    /// Verifies that a deadline which has already passed resolves immediately.
+    #[tokio::test]
+    async fn past_deadline_pollable_is_immediately_ready() {
+        let deadline = std::time::Instant::now() - Duration::from_secs(1);
+        Deadline::Instant(deadline).ready().await;
     }
 }
