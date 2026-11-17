@@ -105,6 +105,73 @@ fn missing_import_selects_max() -> Result<()> {
     Ok(())
 }
 
+/// A component importing a canonical name (e.g. `a:b/c@0.2`) must link
+/// against a host definition registered under a full version (e.g.
+/// `a:b/c@0.2.1`), and vice versa, during the transition to canonical names.
+///
+/// See #14346.
+#[test]
+fn canonical_import_importing_full_item() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_component_model_canonical_names(true);
+    let engine = Engine::new(&config)?;
+    let mut linker = Linker::<()>::new(&engine);
+
+    let ty = ResourceType::host::<u32>();
+    linker
+        .instance("a:b/c@0.2.1")?
+        .resource("r", ty, |_, _| Ok(()))?;
+
+    let component = Component::new(
+        &engine,
+        // The import name here is the canonical name `a:b/c@0.2` with a
+        // version-suffix distinguishing it from other releases on the `0.2`
+        // track, and it's recorded in wasmtime's imports as the bare
+        // canonical name.
+        r#"(component
+            (import "a:b/c@0.2" (version-suffix ".1") (instance $i
+                (export "r" (type (sub resource)))
+            ))
+            (alias export $i "r" (type $t))
+            (export "t" (type $t))
+        )"#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let i = linker.instantiate(&mut store, &component)?;
+
+    assert_eq!(i.get_resource(&mut store, "t"), Some(ty));
+
+    Ok(())
+}
+
+/// The opposite of [`canonical_import_importing_full_item`]: a component
+/// importing a full version (e.g. `a:b/c@1.2.3`) must link against a host
+/// definition registered under a canonical name (e.g. `a:b/c@1`).
+///
+/// See #14346.
+#[test]
+fn full_import_importing_canonical_item() -> Result<()> {
+    let engine = Engine::default();
+    let mut linker = Linker::<()>::new(&engine);
+
+    let ty = ResourceType::host::<u32>();
+    linker.root().resource("a:b/c@1", ty, |_, _| Ok(()))?;
+
+    let component = Component::new(
+        &engine,
+        r#"(component
+            (import "a:b/c@1.2.3" (type $t (sub resource)))
+            (export "t" (type $t))
+        )"#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let i = linker.instantiate(&mut store, &component)?;
+
+    assert_eq!(i.get_resource(&mut store, "t"), Some(ty));
+
+    Ok(())
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn linker_substituting_types_issue_8003() -> Result<()> {

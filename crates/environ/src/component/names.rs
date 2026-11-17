@@ -287,34 +287,105 @@ impl NameMapIntern for StringPool {
 /// * `foo:bar/baz@0.0.1` => `None`
 /// * `foo:bar/baz@0.1.0-rc.2` => `None`
 ///
+/// Note that canonical names such as `foo:bar/baz@1` or `foo:bar/baz@0.1`,
+/// which are already reduced, are returned as-is. This enables lookups of a
+/// canonical name to match a full version (e.g. `foo:bar/baz@1.2.3`) and
+/// vice versa.
+///
 /// This alternate lookup key is intended to serve the purpose where a
 /// semver-compatible definition can be located, if one is defined, at perhaps
 /// either a newer or an older version.
 pub fn alternate_lookup_key(name: &str) -> Option<(&str, Version)> {
     let at = name.find('@')?;
     let version_string = &name[at + 1..];
-    let version = Version::parse(version_string).ok()?;
+
+    // A "canonical" name such as `a:b/c@1` or `a:b/c@0.1` doesn't have a full
+    // semver version, so fill in the missing numbers here to get a `Version`
+    // for the compatible track that the name is on.
+    let (alternate_key, version) = match Version::parse(version_string) {
+        // Full semver versions are reduced below to the canonical form of the
+        // version.
+        Ok(version) => (
+            reduce_to_canonical(name, at, version_string, &version)?,
+            version,
+        ),
+
+        // Canonical names such as `@1` or `@0.1` are already in reduced form
+        // and are returned as-is so they hash to the same key as all the full
+        // versions on the same compatible track. That enables matching a
+        // definition of a canonical name with a lookup of a full version, or
+        // vice versa, during the transition to canonical names.
+        Err(_) => match canonical_version(version_string) {
+            Some(version) => (&name[..at + 1 + version_string.len()], version),
+            None => return None,
+        },
+    };
+    Some((alternate_key, version))
+}
+
+/// Reduces the full semver `version` of the name `name` (with `@` at `at` and
+/// the version string starting at `at + 1`) to the "canonical" form, such as
+/// `a:b/c@1` for `a:b/c@1.2.3` or `a:b/c@0.1` for `a:b/c@0.1.2`.
+///
+/// Returns `None` for versions that aren't compatible with any other version,
+/// such as prereleases or `0.0.x`.
+fn reduce_to_canonical<'a>(
+    name: &'a str,
+    at: usize,
+    version_string: &str,
+    version: &Version,
+) -> Option<&'a str> {
     if !version.pre.is_empty() {
         // If there's a prerelease then don't consider that compatible with any
         // other version number.
-        None
-    } else if version.major != 0 {
+        return None;
+    }
+    if version.major != 0 {
         // If the major number is nonzero then compatibility is up to the major
         // version number, so return up to the first decimal.
-        let first_dot = version_string.find('.')? + at + 1;
-        Some((&name[..first_dot], version))
+        let first_dot = version_string.find('.')?;
+        Some(&name[..at + 1 + first_dot])
     } else if version.minor != 0 {
         // Like the major version if the minor is nonzero then patch releases
         // are all considered to be on a "compatible track".
-        let first_dot = version_string.find('.')? + at + 1;
-        let second_dot = name[first_dot + 1..].find('.')? + first_dot + 1;
-        Some((&name[..second_dot], version))
+        let first_dot = version_string.find('.')?;
+        let second_dot = version_string[first_dot + 1..].find('.')? + first_dot + 1;
+        Some(&name[..at + 1 + second_dot])
+    } else if version.patch == 0 {
+        // 0.0.0 matches itself, and build metadata doesn't affect
+        // compatibility, so reduce to just `0.0.0`.
+        let len = version_string.find('+').unwrap_or(version_string.len());
+        Some(&name[..at + 1 + len])
     } else {
         // If the patch number is the first nonzero entry then nothing can be
-        // compatible with this patch, e.g. 0.0.1 isn't' compatible with
+        // compatible with this patch, e.g. 0.0.1 isn't compatible with
         // any other version inherently.
         None
     }
+}
+
+/// Parses a canonical version such as `1` or `0.1`, filling in the missing
+/// numbers, returning `None` if `version` isn't a canonical version.
+fn canonical_version(version: &str) -> Option<Version> {
+    // Reject anything with a prerelease or build metadata: those are never
+    // canonical versions and would parse ambiguously below.
+    if version.contains('-') || version.contains('+') {
+        return None;
+    }
+    let mut numbers = version.split('.');
+    let (major, minor, patch) = match (numbers.next(), numbers.next(), numbers.next()) {
+        // `0` and `0.0` aren't canonical versions: only a nonzero major or
+        // `0.minor` with a nonzero minor are.
+        (Some("0"), None, None) | (Some("0"), Some("0"), None) => return None,
+        (Some(major), None, None) if major != "0" => (major, "0", "0"),
+        (Some("0"), Some(minor), None) if minor != "0" => ("0", minor, "0"),
+        _ => return None,
+    };
+    let is_number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !is_number(major) || !is_number(minor) || !is_number(patch) {
+        return None;
+    }
+    Version::parse(&format!("{major}.{minor}.{patch}")).ok()
 }
 
 #[cfg(test)]
@@ -342,6 +413,20 @@ mod tests {
         assert_eq!(alt("x:y/z@0.0.1-pre"), None);
         assert_eq!(alt("x:y/z@0.1.0-pre"), None);
         assert_eq!(alt("x:y/z@1.0.0-pre"), None);
+
+        // Canonical names are already in their reduced form and are returned
+        // as-is so that they hash the same as full versions on the same
+        // compatible track.
+        assert_eq!(alt("x:y/z@1"), Some("x:y/z@1"));
+        assert_eq!(alt("x:y/z@2"), Some("x:y/z@2"));
+        assert_eq!(alt("x:y/z@0.1"), Some("x:y/z@0.1"));
+        assert_eq!(alt("x:y/z@0.2"), Some("x:y/z@0.2"));
+        assert_eq!(alt("x:y/z@0.0.0"), Some("x:y/z@0.0.0"));
+        assert_eq!(alt("x:y/z@0"), None);
+        assert_eq!(alt("x:y/z@0.0"), None);
+        assert_eq!(alt("x:y/z@1.2"), None);
+        assert_eq!(alt("x:y/z@1-pre"), None);
+        assert_eq!(alt("x:y/z@0.1-pre"), None);
     }
 
     #[test]
@@ -365,5 +450,32 @@ mod tests {
         assert_eq!(map.get("a:b/c@1.0.1", &intern), Some(&3));
         assert_eq!(map.get("a:b/c@1.0.2", &intern), Some(&3));
         assert_eq!(map.get("a:b/c@1.1.0", &intern), Some(&3));
+    }
+
+    /// Definitions with a canonical name (e.g. `a:b/c@0.2`, without a full
+    /// semver) must be found when looking up a full version name (e.g.
+    /// `a:b/c@0.2.1`) and vice versa.
+    #[test]
+    fn name_map_canonical_names() {
+        let mut map = NameMap::default();
+        let mut intern = NameMapNoIntern;
+
+        // A full version defined in the map is found via a canonical name
+        // lookup, e.g. a component importing `a:b/c@0.2` links against a
+        // host definition of `a:b/c@0.2.1`.
+        map.insert("a:b/c@0.2.1", &mut intern, false, 0).unwrap();
+        assert_eq!(map.get("a:b/c@0.2", &intern), Some(&0));
+        assert_eq!(map.get("a:b/c@0.2.1", &intern), Some(&0));
+        assert_eq!(map.get("a:b/c@0.2.2", &intern), Some(&0));
+        assert_eq!(map.get("a:b/c@0.3", &intern), None);
+
+        // A canonical name defined in the map is found via a full version
+        // lookup, e.g. a host definition of `a:b/c@1` links against a
+        // component importing `a:b/c@1.2.3`.
+        map.insert("a:b/d@1", &mut intern, false, 1).unwrap();
+        assert_eq!(map.get("a:b/d@1", &intern), Some(&1));
+        assert_eq!(map.get("a:b/d@1.2.3", &intern), Some(&1));
+        assert_eq!(map.get("a:b/d@1.9.0", &intern), Some(&1));
+        assert_eq!(map.get("a:b/d@2", &intern), None);
     }
 }
