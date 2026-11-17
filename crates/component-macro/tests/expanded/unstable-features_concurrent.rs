@@ -17,15 +17,30 @@ impl LinkOptions {
         self.experimental_interface = enabled;
         self
     }
+    /// Returns whether members marked as `@unstable(feature = experimental-interface)`
+    /// are enabled.
+    pub fn experimental_interface_enabled(&self) -> bool {
+        self.experimental_interface
+    }
     /// Enable members marked as `@unstable(feature = experimental-interface-function)`
     pub fn experimental_interface_function(&mut self, enabled: bool) -> &mut Self {
         self.experimental_interface_function = enabled;
         self
     }
+    /// Returns whether members marked as `@unstable(feature = experimental-interface-function)`
+    /// are enabled.
+    pub fn experimental_interface_function_enabled(&self) -> bool {
+        self.experimental_interface_function
+    }
     /// Enable members marked as `@unstable(feature = experimental-interface-resource)`
     pub fn experimental_interface_resource(&mut self, enabled: bool) -> &mut Self {
         self.experimental_interface_resource = enabled;
         self
+    }
+    /// Returns whether members marked as `@unstable(feature = experimental-interface-resource)`
+    /// are enabled.
+    pub fn experimental_interface_resource_enabled(&self) -> bool {
+        self.experimental_interface_resource
     }
     /// Enable members marked as `@unstable(feature = experimental-interface-resource-method)`
     pub fn experimental_interface_resource_method(
@@ -35,30 +50,60 @@ impl LinkOptions {
         self.experimental_interface_resource_method = enabled;
         self
     }
+    /// Returns whether members marked as `@unstable(feature = experimental-interface-resource-method)`
+    /// are enabled.
+    pub fn experimental_interface_resource_method_enabled(&self) -> bool {
+        self.experimental_interface_resource_method
+    }
     /// Enable members marked as `@unstable(feature = experimental-world)`
     pub fn experimental_world(&mut self, enabled: bool) -> &mut Self {
         self.experimental_world = enabled;
         self
+    }
+    /// Returns whether members marked as `@unstable(feature = experimental-world)`
+    /// are enabled.
+    pub fn experimental_world_enabled(&self) -> bool {
+        self.experimental_world
     }
     /// Enable members marked as `@unstable(feature = experimental-world-function-import)`
     pub fn experimental_world_function_import(&mut self, enabled: bool) -> &mut Self {
         self.experimental_world_function_import = enabled;
         self
     }
+    /// Returns whether members marked as `@unstable(feature = experimental-world-function-import)`
+    /// are enabled.
+    pub fn experimental_world_function_import_enabled(&self) -> bool {
+        self.experimental_world_function_import
+    }
     /// Enable members marked as `@unstable(feature = experimental-world-interface-import)`
     pub fn experimental_world_interface_import(&mut self, enabled: bool) -> &mut Self {
         self.experimental_world_interface_import = enabled;
         self
+    }
+    /// Returns whether members marked as `@unstable(feature = experimental-world-interface-import)`
+    /// are enabled.
+    pub fn experimental_world_interface_import_enabled(&self) -> bool {
+        self.experimental_world_interface_import
     }
     /// Enable members marked as `@unstable(feature = experimental-world-resource)`
     pub fn experimental_world_resource(&mut self, enabled: bool) -> &mut Self {
         self.experimental_world_resource = enabled;
         self
     }
+    /// Returns whether members marked as `@unstable(feature = experimental-world-resource)`
+    /// are enabled.
+    pub fn experimental_world_resource_enabled(&self) -> bool {
+        self.experimental_world_resource
+    }
     /// Enable members marked as `@unstable(feature = experimental-world-resource-method)`
     pub fn experimental_world_resource_method(&mut self, enabled: bool) -> &mut Self {
         self.experimental_world_resource_method = enabled;
         self
+    }
+    /// Returns whether members marked as `@unstable(feature = experimental-world-resource-method)`
+    /// are enabled.
+    pub fn experimental_world_resource_method_enabled(&self) -> bool {
+        self.experimental_world_resource_method
     }
 }
 impl ::core::convert::From<LinkOptions> for foo::foo::the_interface::LinkOptions {
@@ -275,8 +320,8 @@ const _: () = {
             T: 'static + Send,
         {
             let mut linker = linker.root();
-            if options.experimental_world {
-                if options.experimental_world_resource {
+            if options.experimental_world_enabled() {
+                if options.experimental_world_resource_enabled() {
                     linker
                         .resource_concurrent(
                             "baz",
@@ -297,7 +342,7 @@ const _: () = {
                             },
                         )?;
                 }
-                if options.experimental_world_function_import {
+                if options.experimental_world_function_import_enabled() {
                     linker
                         .func_wrap_async(
                             "foo",
@@ -316,7 +361,7 @@ const _: () = {
                             },
                         )?;
                 }
-                if options.experimental_world_resource_method {
+                if options.experimental_world_resource_method_enabled() {
                     linker
                         .func_wrap_async(
                             "[method]baz.foo",
@@ -352,9 +397,9 @@ const _: () = {
             for<'a> D::Data<'a>: foo::foo::the_interface::Host + TheWorldImports + Send,
             T: 'static + Send,
         {
-            if options.experimental_world {
+            if options.experimental_world_enabled() {
                 Self::add_to_linker_imports::<T, D>(linker, options, host_getter)?;
-                if options.experimental_world_interface_import {
+                if options.experimental_world_interface_import_enabled() {
                     foo::foo::the_interface::add_to_linker::<
                         T,
                         D,
@@ -385,6 +430,11 @@ pub mod foo {
                     self.experimental_interface = enabled;
                     self
                 }
+                /// Returns whether members marked as `@unstable(feature = experimental-interface)`
+                /// are enabled.
+                pub fn experimental_interface_enabled(&self) -> bool {
+                    self.experimental_interface
+                }
                 /// Enable members marked as `@unstable(feature = experimental-interface-function)`
                 pub fn experimental_interface_function(
                     &mut self,
@@ -392,6 +442,11 @@ pub mod foo {
                 ) -> &mut Self {
                     self.experimental_interface_function = enabled;
                     self
+                }
+                /// Returns whether members marked as `@unstable(feature = experimental-interface-function)`
+                /// are enabled.
+                pub fn experimental_interface_function_enabled(&self) -> bool {
+                    self.experimental_interface_function
                 }
                 /// Enable members marked as `@unstable(feature = experimental-interface-resource)`
                 pub fn experimental_interface_resource(
@@ -401,6 +456,11 @@ pub mod foo {
                     self.experimental_interface_resource = enabled;
                     self
                 }
+                /// Returns whether members marked as `@unstable(feature = experimental-interface-resource)`
+                /// are enabled.
+                pub fn experimental_interface_resource_enabled(&self) -> bool {
+                    self.experimental_interface_resource
+                }
                 /// Enable members marked as `@unstable(feature = experimental-interface-resource-method)`
                 pub fn experimental_interface_resource_method(
                     &mut self,
@@ -408,6 +468,11 @@ pub mod foo {
                 ) -> &mut Self {
                     self.experimental_interface_resource_method = enabled;
                     self
+                }
+                /// Returns whether members marked as `@unstable(feature = experimental-interface-resource-method)`
+                /// are enabled.
+                pub fn experimental_interface_resource_method_enabled(&self) -> bool {
+                    self.experimental_interface_resource_method
                 }
             }
             pub enum Bar {}
@@ -444,8 +509,8 @@ pub mod foo {
                 for<'a> D::Data<'a>: Host,
                 T: 'static + Send,
             {
-                if options.experimental_interface {
-                    if options.experimental_interface_resource {
+                if options.experimental_interface_enabled() {
+                    if options.experimental_interface_resource_enabled() {
                         inst.resource_concurrent(
                             "bar",
                             wasmtime::component::ResourceType::host::<Bar>(),
@@ -465,7 +530,7 @@ pub mod foo {
                             },
                         )?;
                     }
-                    if options.experimental_interface_function {
+                    if options.experimental_interface_function_enabled() {
                         inst.func_wrap_async(
                             "foo",
                             move |mut caller: wasmtime::StoreContextMut<'_, T>, (): ()| {
@@ -483,7 +548,7 @@ pub mod foo {
                             },
                         )?;
                     }
-                    if options.experimental_interface_resource_method {
+                    if options.experimental_interface_resource_method_enabled() {
                         inst.func_wrap_async(
                             "[method]bar.foo",
                             move |

@@ -9,6 +9,11 @@ impl LinkOptions {
         self.experimental = enabled;
         self
     }
+    /// Returns whether members marked as `@unstable(feature = experimental)`
+    /// are enabled.
+    pub fn experimental_enabled(&self) -> bool {
+        self.experimental
+    }
 }
 /// Auto-generated bindings for a pre-instantiated version of a
 /// component which implements the world `w`.
@@ -191,13 +196,13 @@ const _: () = {
                 T,
                 D,
             >(&mut linker.instance("a")?, host_getter)?;
-            if options.experimental {
+            if options.experimental_enabled() {
                 foo::foo::store::add_to_linker_instance::<
                     T,
                     D,
                 >(&mut linker.instance("b")?, host_getter)?;
             }
-            if options.experimental {
+            if options.experimental_enabled() {
                 foo::foo::cache::add_to_linker_instance::<
                     T,
                     D,

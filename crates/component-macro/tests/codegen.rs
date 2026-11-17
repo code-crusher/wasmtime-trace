@@ -1200,6 +1200,76 @@ mod named_imports {
         });
     }
 
+    // Named imports of an interface with unstable features, where the sibling
+    // interface bindings are remapped through `with` (as when reusing
+    // bindings generated in another crate). The named-imports
+    // `add_to_linker` functions take the sibling's `LinkOptions` and must
+    // only access it through its public API, as the fields are private to
+    // whichever crate the sibling lives in.
+    mod unstable_features {
+        mod sibling {
+            wasmtime::component::bindgen!({
+                inline: "
+                    package foo:foo;
+
+                    interface handler {
+                        @unstable(feature = experimental-handler)
+                        handle: func(req: u32) -> u32;
+                        ping: func();
+                    }
+
+                    world the-world {
+                        import handler;
+                    }
+                ",
+            });
+        }
+
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface handler {
+                    @unstable(feature = experimental-handler)
+                    handle: func(req: u32) -> u32;
+                    ping: func();
+                }
+
+                world the-world {
+                    import a: handler;
+                }
+            ",
+            with: {
+                "foo:foo/handler": sibling::foo::foo::handler,
+            },
+            named_imports: {
+                "foo:foo/handler": String,
+            },
+        });
+
+        struct MyHost;
+
+        impl named_imports::foo::foo::handler::Host for MyHost {
+            fn handle(&mut self, _id: String, req: u32) -> u32 {
+                req
+            }
+            fn ping(&mut self, _id: String) {}
+        }
+
+        // The named-imports `LinkOptions` is that of the sibling module that
+        // the interface was remapped to through `with`, and the world-level
+        // `LinkOptions` converts into it.
+        #[test]
+        fn options_convert_to_siblings() {
+            let mut options = LinkOptions::default();
+            assert!(!options.experimental_handler_enabled());
+            options.experimental_handler(true);
+            assert!(options.experimental_handler_enabled());
+            let sibling_options: sibling::foo::foo::handler::LinkOptions = (&options).into();
+            assert!(sibling_options.experimental_handler_enabled());
+        }
+    }
+
     // An unversioned key applies to every imported version of the interface.
     mod unversioned_key_multiple_versions {
         wasmtime::component::bindgen!({

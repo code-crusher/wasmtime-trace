@@ -3856,6 +3856,12 @@ impl LinkOptionsBuilder {
                     self.{feature_rust_name} = enabled;
                     self
                 }}
+
+                /// Returns whether members marked as `@unstable(feature = {feature})`
+                /// are enabled.
+                pub fn {feature_rust_name}_enabled(&self) -> bool {{
+                    self.{feature_rust_name}
+                }}
             "
             );
         }
@@ -3908,7 +3914,11 @@ impl FeatureGate {
     fn open(src: &mut Source, stability: &Stability) -> FeatureGate {
         let close = if let Stability::Unstable { feature, .. } = stability {
             let feature_rust_name = feature.to_snake_case();
-            uwrite!(src, "if options.{feature_rust_name} {{");
+            // Use the public getter rather than reading the field directly:
+            // the `LinkOptions` for a named import can come from another
+            // crate, remapped through the `with` option, whose fields are
+            // not visible here.
+            uwrite!(src, "if options.{feature_rust_name}_enabled() {{");
             true
         } else {
             false
