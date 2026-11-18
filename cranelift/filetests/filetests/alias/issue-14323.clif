@@ -1,0 +1,62 @@
+test interpret
+test run
+set opt_level=speed
+target x86_64
+target aarch64
+
+;; A memory access without an alias region may alias any region, so the
+;; regionless load below must observe the store to `region0` that happens
+;; between it and the earlier `region0` load. Alias analysis used to key
+;; regionless accesses on the last fence only, which a store to a named
+;; region does not advance, so it would forward the first load's value to
+;; the regionless load and drop the intervening store of 42.
+function %regionless_load_after_region_store(i64) -> i32 {
+    ss0 = explicit_slot 4
+    region0 = 0 "heap"
+block0(v0: i64):
+    v9 = stack_addr.i64 ss0
+    v8 = iconst.i32 1
+    store notrap v8, v9
+    v1 = load.i32 notrap region0 v9
+    v2 = iconst.i32 42
+    store notrap region0 v2, v9
+    v3 = load.i32 notrap v9
+    v4 = iadd v3, v1
+    return v4
+}
+; run: %regionless_load_after_region_store(0) == 43
+
+;; Same bug via dead-store elimination: the first store to `region0` used to
+;; be eliminated as dead, leaving the regionless load to read stale memory.
+function %regionless_load_observes_region_store(i64) -> i32 {
+    ss0 = explicit_slot 4
+    region0 = 0 "heap"
+block0(v0: i64):
+    v9 = stack_addr.i64 ss0
+    v2 = iconst.i32 42
+    store notrap region0 v2, v9
+    v3 = load.i32 notrap v9
+    v5 = iconst.i32 7
+    store notrap region0 v5, v9
+    return v3
+}
+; run: %regionless_load_observes_region_store(0) == 42
+
+;; And the same bug via idempotent-store elimination: the second regionless
+;; store used to be removed as idempotent even though the intervening store
+;; to `region0` had overwritten the location.
+function %regionless_store_after_region_store(i64) -> i32 {
+    ss0 = explicit_slot 4
+    region0 = 0 "heap"
+block0(v0: i64):
+    v9 = stack_addr.i64 ss0
+    v5 = iconst.i32 5
+    store notrap v5, v9
+    v10 = iconst.i32 9
+    store notrap region0 v10, v9
+    v11 = load.i32 notrap v9
+    store notrap v5, v9
+    v12 = load.i32 notrap region0 v9
+    return v12
+}
+; run: %regionless_store_after_region_store(0) == 5
