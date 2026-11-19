@@ -18,9 +18,15 @@
 //! `S` to access the same memory location `L`. This invariant must be
 //! provided by the CLIF-producing frontend.
 //!
+//! Accesses with no alias region promise nothing: they may alias any
+//! region. A store with no alias region is therefore treated as a
+//! fence, and a load with no alias region is treated as observing
+//! every region.
+//!
 //! Given that this non-aliasing property is provided by the CLIF
 //! producer, we can compute a *may-alias* property: one load or store
-//! may-alias another load or store if both access the same region.
+//! may-alias another load or store if both access the same region, or
+//! if either of them has no alias region.
 //!
 //! The "last store" pass helps to compute this aliasing: it scans the
 //! code, finding at each program point the last instruction that
@@ -125,8 +131,6 @@ enum AliasRegionsObserved {
     All,
     /// Just the given alias region.
     Just(AliasRegion),
-    /// Just the "other" / missing alias region.
-    Other,
     /// No alias regions observed.
     None,
 }
@@ -158,7 +162,12 @@ fn alias_regions_observed(
         if let Some(region) = memflags.and_then(|flags| flags.alias_region()) {
             AliasRegionsObserved::Just(region)
         } else {
-            AliasRegionsObserved::Other
+            // A load with no alias region may alias any region: the CLIF
+            // producer only promises that accesses *tagged with* regions are
+            // disjoint from each other, so an untagged load can observe
+            // anything. (Untagged stores are already treated as fences for the
+            // same reason.)
+            AliasRegionsObserved::All
         }
     } else {
         AliasRegionsObserved::None
@@ -317,10 +326,17 @@ struct LastStores {
     ///
     /// This applies to ALL regions, including ones not yet in the `regions`
     /// map.
-    ///
-    /// This is also the last store for memory accesses that have no alias
-    /// region: such a store may alias any region, and so is treated as a fence.
     last_fence: LastStore,
+
+    /// The last store of any kind: to a named region, or a fence-like store
+    /// with no alias region.
+    ///
+    /// An access with no alias region may alias *any* region, so the last
+    /// store it may have read from (or be overwriting) is the last store to
+    /// any region at all. Keying such accesses on `last_fence` alone would
+    /// miss intervening stores to named regions, which leave `last_fence`
+    /// untouched: see issue #14323.
+    last_any: LastStore,
 }
 
 /// What effect does an instruction have on the last-store state?
@@ -417,6 +433,7 @@ impl LastStores {
                 // NB: unlike every region slot, `self.last_fence` is *not*
                 // observed by a fence; see `observe_inst`.
                 self.last_fence = inst.into();
+                self.last_any = inst.into();
             }
 
             // Trapping instructions and pure observers leave every slot alone.
@@ -427,6 +444,7 @@ impl LastStores {
                 can_trap: _,
             } => {
                 self.regions[region] = inst.into();
+                self.last_any = inst.into();
             }
         }
     }
@@ -509,9 +527,6 @@ impl LastStores {
                 // region, we have also observed the last such store, which
                 // `self.last_fence` tracks.
                 observe(func, observed, self.last_fence, inst);
-            }
-            InstEffect::Observes(AliasRegionsObserved::Other) => {
-                observe(func, observed, self.last_fence, inst)
             }
             InstEffect::Observes(AliasRegionsObserved::None) => {}
         }
@@ -607,10 +622,15 @@ impl LastStores {
     }
 
     /// Get the last store to the given `inst`'s alias region.
+    ///
+    /// An access with no alias region may alias *any* region, so it keys on
+    /// the last store of any kind, `last_any`, rather than on `last_fence`:
+    /// stores to named regions may have written the same bytes and leave
+    /// `last_fence` untouched. See issue #14323.
     fn get_last_store(&self, func: &Function, inst: Inst) -> LastStore {
         if let Some(memflags) = func.dfg.insts[inst].memflags() {
             return match func.dfg.mem_flags[memflags].alias_region() {
-                None => self.last_fence,
+                None => self.last_any,
                 Some(region) => self.last_store_for_region(region),
             };
         }
@@ -632,6 +652,7 @@ impl LastStores {
         let LastStores {
             regions,
             last_fence,
+            last_any,
         } = self;
 
         let mut changed = false;
@@ -649,6 +670,7 @@ impl LastStores {
         }
 
         meet(last_fence, rhs.last_fence);
+        meet(last_any, rhs.last_any);
 
         changed
     }
@@ -1111,6 +1133,10 @@ impl<'a> AliasAnalysis<'a> {
 
                 if succ_input.last_fence == LastStore::Unknown {
                     observe(func, &mut observed_stores, state.last_fence, observer);
+                }
+
+                if succ_input.last_any == LastStore::Unknown {
+                    observe(func, &mut observed_stores, state.last_any, observer);
                 }
             });
         }

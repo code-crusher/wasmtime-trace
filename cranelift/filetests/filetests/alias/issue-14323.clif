@@ -1,0 +1,51 @@
+test interpret
+test run
+set opt_level=speed
+target x86_64
+target aarch64
+
+;; Regression test for https://github.com/bytecodealliance/wasmtime/issues/14323
+;;
+;; A load with no alias region may alias any region, so it must observe a
+;; preceding store that carries an alias region. Alias analysis used to key
+;; the regionless load on `last_fence` only, which a store to a named region
+;; does not update, and so forwarded the value of the earlier region0 load
+;; (v1 = 1) across the intervening store of 42, returning 2 instead of 43.
+
+function %regionless_load_after_region_store(i64) -> i32 {
+    ss0 = explicit_slot 4
+    region0 = 0 "heap"
+block0(v0: i64):
+    v9 = stack_addr.i64 ss0
+    v8 = iconst.i32 1
+    store notrap v8, v9
+    v1 = load.i32 notrap region0 v9
+    v2 = iconst.i32 42
+    store notrap region0 v2, v9
+    v3 = load.i32 notrap v9
+    v4 = iadd v3, v1
+    return v4
+}
+
+; run: %regionless_load_after_region_store(0) == 43
+
+;; And a variant of the same problem for dead-store elimination: the
+;; regionless load `v3` observes the `region0` store `inst1`, so `inst1`
+;; cannot be eliminated as dead by the later `region0` store. Eliminating it
+;; used to leave `v3` reading whatever was in the stack slot before the
+;; call, returning garbage instead of 42.
+
+function %dse(i64) -> i32 {
+    ss0 = explicit_slot 4
+    region0 = 0 "heap"
+block0(v0: i64):
+    v9 = stack_addr.i64 ss0
+    v2 = iconst.i32 42
+    store notrap region0 v2, v9
+    v3 = load.i32 notrap v9
+    v5 = iconst.i32 7
+    store notrap region0 v5, v9
+    return v3
+}
+
+; run: %dse(0) == 42
