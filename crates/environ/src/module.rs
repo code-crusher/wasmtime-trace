@@ -203,6 +203,36 @@ impl TableSegmentElements {
             Self::Expressions { exprs, .. } => u64::try_from(exprs.len()).unwrap(),
         }
     }
+
+    /// If every element in this segment is the same `ref.null` constant, then
+    /// this returns the heap type of that null constant. Otherwise `None` is
+    /// returned.
+    ///
+    /// Nulls all translate to the same runtime value (zero) for their type's
+    /// top heap type so segments with uniform null elements can be filled with
+    /// one value instead of translating each element separately. Note that
+    /// `Functions` segments never contain null entries as far as this method is
+    /// concerned because those use `FuncIndex::reserved_value()` which isn't
+    /// distinguishable from an actual function index here.
+    pub fn as_uniform_null(&self) -> Option<WasmHeapType> {
+        match self {
+            Self::Functions(_) => None,
+            Self::Expressions { exprs, ty: _ } => {
+                let heap_ty = match exprs.first()?.ops() {
+                    [ConstOp::RefNull(heap_ty)] => *heap_ty,
+                    _ => return None,
+                };
+                if exprs
+                    .iter()
+                    .all(|expr| matches!(expr.ops(), [ConstOp::RefNull(t)] if *t == heap_ty))
+                {
+                    Some(heap_ty)
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// A translated WebAssembly module, excluding the function bodies and

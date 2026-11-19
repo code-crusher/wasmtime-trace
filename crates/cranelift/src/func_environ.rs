@@ -6594,9 +6594,28 @@ impl FuncEnvironment<'_> {
             }
         };
 
-        // Re-use the `table.set` translation for making this a simple function
-        // to define. That re-executes the bounds check which is a bit
+        // If every element of the segment is the same null constant then the
+        // whole segment reduces to a single `table.fill` of null which is a
+        // constant-time function to compile regardless of how large the
+        // segment is. Otherwise fall back to re-using the `table.set`
+        // translation for each element to make this a simple function to
+        // define. That re-executes the bounds check which is a bit
         // inefficient, but can be optimized in the future.
+        if let Some(null_ty) = elements.as_uniform_null() {
+            let null = self.translate_ref_null(builder.cursor(), null_ty)?;
+            self.translate_entity_fill(
+                builder,
+                CheckedEntity::Table {
+                    table: segment.table_index,
+                    initialized: true,
+                },
+                offset,
+                null,
+                segment_len,
+            )?;
+            return self.post_translate_bulk_op(builder, fuel);
+        }
+
         match elements {
             TableSegmentElements::Functions(indices) => {
                 for (i, func) in indices.iter().enumerate() {

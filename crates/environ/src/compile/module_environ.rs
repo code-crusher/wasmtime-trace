@@ -1714,12 +1714,17 @@ impl ModuleTranslation<'_> {
             }
 
             // Function indices can be optimized here, but fully general
-            // expressions are deferred to get evaluated at runtime.
-            let function_elements = match &segment.init {
-                TableSegmentInit::Direct(TableSegmentElements::Functions(indices)) => indices,
-                TableSegmentInit::Direct(TableSegmentElements::Expressions { .. })
-                | TableSegmentInit::Staged { .. } => break,
+            // expressions are deferred to get evaluated at runtime. The
+            // exception to that is segments which are all null since null is
+            // the same as the reserved "no function" value that the rest of
+            // the precomputed image already uses.
+            let elements = match &segment.init {
+                TableSegmentInit::Direct(elements) => elements,
+                TableSegmentInit::Staged { .. } => break,
             };
+            let all_null = elements
+                .as_uniform_null()
+                .is_some_and(|heap_ty| heap_ty.top() == WasmHeapTopType::Func);
 
             match &self.table_initialization.initial_values[defined_index] {
                 TableInitialValue::Null => {}
@@ -1732,20 +1737,30 @@ impl ModuleTranslation<'_> {
                 // optimization.
                 TableInitialValue::Expr(_) => break,
             }
-            let precomputed = &mut self.module.table_initialization[defined_index];
 
             // At this point we're committing to pre-initializing the table
             // with the `segment` that's being iterated over. This segment is
             // applied to the `precomputed` list for the table by ensuring
             // it's large enough to hold the segment and then copying the
-            // segment into the precomputed list.
+            // segment into the precomputed list. All-null segments fill the
+            // range with the reserved value which the runtime interprets as
+            // null.
+            let precomputed = &mut self.module.table_initialization[defined_index];
             if precomputed.len() < top as usize {
                 precomputed
                     .resize(top as usize, FuncIndex::reserved_value())
                     .panic_on_oom();
             }
             let dst = &mut precomputed[offset as usize..top as usize];
-            dst.copy_from_slice(&function_elements);
+            if all_null {
+                dst.fill(FuncIndex::reserved_value());
+            } else {
+                let function_elements = match elements {
+                    TableSegmentElements::Functions(indices) => indices,
+                    TableSegmentElements::Expressions { .. } => break,
+                };
+                dst.copy_from_slice(&function_elements);
+            }
 
             // advance the iterator to see the next segment
             let _ = segments.next();
