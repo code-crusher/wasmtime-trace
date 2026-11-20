@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.39s
+   Doc-tests wasmtime
+
+running 6 tests
+test crates/wasmtime/src/runtime/func.rs - runtime::func::Func::wrap (line 765) ... ok
+test crates/wasmtime/src/runtime/func.rs - runtime::func::Func::wrap (line 727) ... ok
+test crates/wasmtime/src/runtime/func.rs - runtime::func::Func::wrap (line 670) ... ok
+test crates/wasmtime/src/runtime/func.rs - runtime::func::Func::wrap (line 696) ... ok
+test crates/wasmtime/src/runtime/externals/table.rs - runtime::externals::table::Table::new (line 74) ... ok
+test crates/wasmtime/src/runtime/externals/global.rs - runtime::externals::global::Global::new (line 70) ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 148 filtered out; finished in 3.66s
+
+all doctests ran in 4.31s; merged doctests compilation took 0.61s
+EXIT=0

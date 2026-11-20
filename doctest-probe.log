@@ -1,0 +1,17 @@
+   Compiling wasmtime-environ v52.0.0-dev (/workspace/crates/environ)
+   Compiling wasmtime-internal-unwinder v52.0.0-dev (/workspace/crates/unwinder)
+   Compiling wasmtime-internal-cache v52.0.0-dev (/workspace/crates/cache)
+   Compiling wasmtime-internal-fiber v52.0.0-dev (/workspace/crates/fiber)
+   Compiling wasmtime-test-util v52.0.0-dev (/workspace/crates/test-util)
+   Compiling wasmtime-internal-cranelift v52.0.0-dev (/workspace/crates/cranelift)
+   Compiling wasmtime v52.0.0-dev (/workspace/crates/wasmtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 49s
+   Doc-tests wasmtime
+
+running 1 test
+test crates/wasmtime/src/runtime/externals/global.rs - runtime::externals::global::Global::new (line 70) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 153 filtered out; finished in 1.55s
+
+all doctests ran in 2.33s; merged doctests compilation took 0.74s
+EXIT=0

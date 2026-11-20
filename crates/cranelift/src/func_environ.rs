@@ -450,11 +450,16 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             // statically know which defined memory always satisfies the import
             // and everything else that imports it knows the same.
             None => match self.translation.known_imported_memories[memory] {
-                Some(known) => {
+                Some(known)
+                    if self
+                        .translation
+                        .imported_memories_known_to_importers
+                        .contains(memory) =>
+                {
                     self.alias_regions
                         .defined_memory_region(func, known.module, known.index)
                 }
-                None => self.alias_regions.public_memory_region(func),
+                _ => self.alias_regions.public_memory_region(func),
             },
         }
     }
@@ -484,11 +489,16 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
                 }
             }
             None => match self.translation.known_imported_tables[table] {
-                Some(known) => {
+                Some(known)
+                    if self
+                        .translation
+                        .imported_tables_known_to_importers
+                        .contains(table) =>
+                {
                     self.alias_regions
                         .defined_table_region(func, known.module, known.index)
                 }
-                None => self.alias_regions.public_table_region(func),
+                _ => self.alias_regions.public_table_region(func),
             },
         }
     }
@@ -518,16 +528,27 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
                 }
             }
             None => match self.translation.known_imported_globals[global] {
-                Some(KnownGlobal::Defined(known)) => {
+                Some(KnownGlobal::Defined(known))
+                    if self
+                        .translation
+                        .imported_globals_known_to_importers
+                        .contains(global) =>
+                {
                     self.alias_regions
                         .defined_global_region(func, known.module, known.index)
                 }
-                Some(KnownGlobal::ComponentInstanceFlags(instance)) => self
-                    .alias_regions
-                    .vmcomponent()
-                    .may_leave(instance)
-                    .region(func),
-                None => self.alias_regions.public_global_region(func),
+                Some(KnownGlobal::ComponentInstanceFlags(instance))
+                    if self
+                        .translation
+                        .imported_globals_known_to_importers
+                        .contains(global) =>
+                {
+                    self.alias_regions
+                        .vmcomponent()
+                        .may_leave(instance)
+                        .region(func)
+                }
+                _ => self.alias_regions.public_global_region(func),
             },
         }
     }
@@ -1595,16 +1616,21 @@ impl FuncEnvironment<'_> {
         let ty = self.module.globals[index].wasm_ty;
 
         if !ty.is_vmgcref_type() && !self.module.globals[index].mutability {
-            if let Some(index) = self.module.defined_global_index(index) {
-                if let Ok(i) = self
-                    .module
-                    .global_initializers
-                    .binary_search_by_key(&index, |(def_index, _)| *def_index)
-                {
-                    let (_, value) = self.module.global_initializers[i];
-                    return Some(value);
-                }
+            if let Some(def) = self.module.defined_global_index(index) {
+                return self.module.global_const_value(def);
             }
+
+            // This is an imported global. When this module is only ever
+            // instantiated with the same defined global, and that global is
+            // immutable with a simple initializer, the import's value is always
+            // the same constant, and we can inline it at each `global.get`.
+            //
+            // Note that this does not need the import's entity to be known to
+            // every other module that may import it (which is what using its
+            // precise alias region instead of the public one would need): the
+            // value is the same no matter which alias region it is accessed
+            // through.
+            return self.translation.imported_global_values[index];
         }
 
         None

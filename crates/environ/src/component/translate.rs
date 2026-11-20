@@ -632,7 +632,8 @@ impl<'a, 'data> Translator<'a, 'data> {
         // calls (and eventually get inlined) rather than indirect calls through
         // the imports table; and global, memory, and table imports so that they
         // can get precise alias regions instead of the conservative regions
-        // shared by everything that crosses a module boundary.
+        // shared by everything that crosses a module boundary, and so that
+        // immutable imported globals can get their constant values inlined.
         for (module, instantiations) in instantiations.iter() {
             let args = match instantiations {
                 dfg::AbstractInstantiations::Many | dfg::AbstractInstantiations::None => continue,
@@ -640,28 +641,44 @@ impl<'a, 'data> Translator<'a, 'data> {
             };
 
             for (i, arg) in args.iter().enumerate() {
-                // Record that this global, memory, or table import is always the
-                // same defined entity, when we know that and when everything
-                // else that imports that entity knows it too.
-                macro_rules! record_known_entity {
-                    ($variant:ident, $imported:expr, $defined_index:ident, $known:ident, $wrap:expr) => {{
-                        let Some((arg_module, EntityIndex::$variant(arg_entity))) =
-                            unambiguous_entity(&instances, &ambiguous.entities, arg)
-                        else {
-                            continue;
-                        };
-                        let index = self.static_modules[arg_module]
-                            .module
-                            .$defined_index(arg_entity)
-                            .expect(
-                                "`resolve_core_export` only returns entities that their module \
-                                 defines",
-                            );
-                        assert!(self.static_modules[module].$known[$imported].is_none());
-                        self.static_modules[module].$known[$imported] = Some($wrap(KnownEntity {
-                            module: arg_module,
-                            index,
-                        }));
+                // Resolve the defined entity that always satisfies this
+                // global, memory, or table import, when we can see through the
+                // argument to the module that defines it.
+                //
+                // Note that this is only the first axis of static knowledge
+                // about the import: "is this import always satisfied by the
+                // same defined entity?" The callers below additionally decide
+                // whether that entity's identity is known to every other module
+                // that may import it, which is what choosing an alias region
+                // needs, but which optimizations like inlining an immutable
+                // global's value do not.
+                macro_rules! known_entity {
+                    ($variant:ident, $defined_index:ident) => {{
+                        match arg {
+                            CoreDef::Export(export) => {
+                                match resolve_core_export(&instances, export) {
+                                    Some((arg_module, EntityIndex::$variant(arg_entity))) => {
+                                        let index = self.static_modules[arg_module]
+                                            .module
+                                            .$defined_index(arg_entity)
+                                            .expect(
+                                                "`resolve_core_export` only returns entities \
+                                                 that their module defines",
+                                            );
+                                        Some((arg_module, arg_entity, index))
+                                    }
+                                    _ => None,
+                                }
+                            }
+
+                            // Trampolines, intrinsics, and component instance
+                            // flags are not entities that get an alias region
+                            // keyed by a defining module and index. (Flags are
+                            // handled separately in the global arm below.)
+                            CoreDef::Trampoline(_)
+                            | CoreDef::UnsafeIntrinsic(_)
+                            | CoreDef::InstanceFlags(_) => None,
+                        }
                     }};
                 }
 
@@ -774,40 +791,116 @@ impl<'a, 'data> Translator<'a, 'data> {
                     // their own alias regions rather than a defined-global one.
                     EntityIndex::Global(imported_global) => match component_flags(arg) {
                         Some(flags) => {
-                            if ambiguous.flags.contains(&flags) {
-                                continue;
-                            }
+                            let translation = &mut self.static_modules[module];
                             assert!(
-                                self.static_modules[module].known_imported_globals[imported_global]
-                                    .is_none()
+                                translation.known_imported_globals[imported_global].is_none()
                             );
-                            self.static_modules[module].known_imported_globals[imported_global] =
-                                Some(flags);
+                            translation.known_imported_globals[imported_global] = Some(flags);
+                            if !ambiguous.flags.contains(&flags) {
+                                translation
+                                    .imported_globals_known_to_importers
+                                    .insert(imported_global);
+                            }
                         }
-                        None => record_known_entity!(
-                            Global,
-                            imported_global,
-                            defined_global_index,
-                            known_imported_globals,
-                            KnownGlobal::Defined
-                        ),
+
+                        None => {
+                            let Some((arg_module, arg_global, index)) =
+                                known_entity!(Global, defined_global_index)
+                            else {
+                                continue;
+                            };
+
+                            // When the global is immutable with a simple
+                            // initializer, every `global.get` of this import
+                            // can inline the constant value. This needs only
+                            // the first axis of static knowledge, not the
+                            // second, so it is recorded unconditionally.
+                            let value = self.static_modules[arg_module]
+                                .module
+                                .global_const_value(index);
+
+                            // Only when the identity of this global is
+                            // additionally known to every other module that
+                            // may import it may this import access it via its
+                            // precise `AliasRegionKey::DefinedGlobal` region.
+                            let known_to_importers = !ambiguous
+                                .entities
+                                .contains(&(arg_module, EntityIndex::Global(arg_global)));
+
+                            let translation = &mut self.static_modules[module];
+                            assert!(
+                                translation.known_imported_globals[imported_global].is_none()
+                            );
+                            translation.known_imported_globals[imported_global] =
+                                Some(KnownGlobal::Defined(KnownEntity {
+                                    module: arg_module,
+                                    index,
+                                }));
+                            if known_to_importers {
+                                translation
+                                    .imported_globals_known_to_importers
+                                    .insert(imported_global);
+                            }
+                            if let Some(value) = value {
+                                translation.imported_global_values[imported_global] = Some(value);
+                            }
+                        }
                     },
 
-                    EntityIndex::Memory(imported_memory) => record_known_entity!(
-                        Memory,
-                        imported_memory,
-                        defined_memory_index,
-                        known_imported_memories,
-                        core::convert::identity
-                    ),
+                    EntityIndex::Memory(imported_memory) => {
+                        let Some((arg_module, arg_memory, index)) =
+                            known_entity!(Memory, defined_memory_index)
+                        else {
+                            continue;
+                        };
 
-                    EntityIndex::Table(imported_table) => record_known_entity!(
-                        Table,
-                        imported_table,
-                        defined_table_index,
-                        known_imported_tables,
-                        core::convert::identity
-                    ),
+                        // Only when the identity of this memory is additionally
+                        // known to every other module that may import it may
+                        // this import access it via its precise
+                        // `AliasRegionKey::DefinedMemory` region.
+                        let known_to_importers = !ambiguous
+                            .entities
+                            .contains(&(arg_module, EntityIndex::Memory(arg_memory)));
+                        let translation = &mut self.static_modules[module];
+                        assert!(translation.known_imported_memories[imported_memory].is_none());
+                        translation.known_imported_memories[imported_memory] =
+                            Some(KnownEntity {
+                                module: arg_module,
+                                index,
+                            });
+                        if known_to_importers {
+                            translation
+                                .imported_memories_known_to_importers
+                                .insert(imported_memory);
+                        }
+                    }
+
+                    EntityIndex::Table(imported_table) => {
+                        let Some((arg_module, arg_table, index)) =
+                            known_entity!(Table, defined_table_index)
+                        else {
+                            continue;
+                        };
+
+                        // Only when the identity of this table is additionally
+                        // known to every other module that may import it may
+                        // this import access it via its precise
+                        // `AliasRegionKey::DefinedTable` region.
+                        let known_to_importers = !ambiguous
+                            .entities
+                            .contains(&(arg_module, EntityIndex::Table(arg_table)));
+                        let translation = &mut self.static_modules[module];
+                        assert!(translation.known_imported_tables[imported_table].is_none());
+                        translation.known_imported_tables[imported_table] = Some(KnownEntity {
+                            module: arg_module,
+                            index,
+                        });
+                        if known_to_importers {
+                            translation
+                                .imported_tables_known_to_importers
+                                .insert(imported_table);
+                        }
+                    }
 
                     // Tags don't have alias regions of their own.
                     EntityIndex::Tag(_) => {}
@@ -2094,23 +2187,6 @@ fn resolve_core_export(
         // the way back to its definition.
         Some(position) => args[position],
     }
-}
-
-/// Same as `resolve_core_export`, but for a `CoreDef` that must additionally be
-/// unambiguous.
-fn unambiguous_entity(
-    instances: &StaticInstances,
-    ambiguous: &HashSet<(StaticModuleIndex, EntityIndex)>,
-    def: &CoreDef,
-) -> Option<(StaticModuleIndex, EntityIndex)> {
-    let CoreDef::Export(export) = def else {
-        return None;
-    };
-    let entity = resolve_core_export(instances, export)?;
-    if ambiguous.contains(&entity) {
-        return None;
-    }
-    Some(entity)
 }
 
 /// Find every core wasm entity in this component whose identity is *not*

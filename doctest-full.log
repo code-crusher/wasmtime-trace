@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.78s
+   Doc-tests wasmtime
+
+running 154 tests
+test crates/environ/src/vmtypes.rs - runtime::vm::vmcontext::VMGcHeader (line 1047) ... ignored
+test crates/environ/src/vmtypes.rs - runtime::vm::vmcontext::VMLazyThread (line 538) ... ignored
+test crates/wasmtime/src/lib.rs - map_maybe_uninit (line 427) ... ignored
+test crates/wasmtime/src/lib.rs - map_maybe_uninit (line 438) ... ignored
+test crates/wasmtime/src/profiling_agent/vtune.rs - profiling_agent::vtune (line 7) ... ignored
+test crates/wasmtime/src/runtime/component/component.rs - runtime::component::component::Component::new (line 165) - compile ... ok

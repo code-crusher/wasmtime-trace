@@ -530,6 +530,30 @@ impl Module {
         self.exports.values().any(|entity| *entity == index.into())
     }
 
+    /// Get the constant value that the given defined global is always
+    /// initialized to, when it is immutable and has a "simple" initializer
+    /// that can be evaluated at compile time.
+    ///
+    /// Returns `None` for mutable globals (whose value can change at runtime,
+    /// even though they have an initializer), GC-reference-typed globals (which
+    /// must be initialized with write barriers at runtime, not by the host),
+    /// and globals with "complicated" initializers that get evaluated by the
+    /// module's startup function.
+    pub fn global_const_value(&self, index: DefinedGlobalIndex) -> Option<GlobalConstValue> {
+        let global = self.globals[self.global_index(index)];
+        if global.mutability || global.wasm_ty.is_vmgcref_type() {
+            return None;
+        }
+
+        // `global_initializers` is sorted by `DefinedGlobalIndex` because the
+        // globals section defines each global, in index order, exactly once.
+        let i = self
+            .global_initializers
+            .binary_search_by_key(&index, |(index, _)| *index)
+            .ok()?;
+        Some(self.global_initializers[i].1)
+    }
+
     /// Test whether the given global index is for an imported global.
     #[inline]
     pub fn is_imported_global(&self, index: GlobalIndex) -> bool {

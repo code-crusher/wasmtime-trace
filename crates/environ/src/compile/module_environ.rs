@@ -7,7 +7,8 @@ use crate::prelude::*;
 use crate::{
     ConstExpr, ConstOp, DataIndex, DefinedFuncIndex, DefinedGlobalIndex, DefinedMemoryIndex,
     DefinedTableIndex, ElemIndex, EngineOrModuleTypeIndex, EntityIndex, EntityType, FuncIndex,
-    FuncKey, GlobalIndex, IndexType, MemoryIndex, MemoryInitializer, ModuleInternedTypeIndex,
+    FuncKey, GlobalConstValue, GlobalIndex, IndexType, MemoryIndex, MemoryInitializer,
+    ModuleInternedTypeIndex,
     ModuleStartup, ModuleTypesBuilder, PanicOnOom as _, PassiveElemIndex, PrimaryMap,
     RuntimeDataIndex, StaticModuleIndex, TableIndex, TableInitialValue, TableInitialization, Tag,
     TagIndex, Trap, Tunables, TypeConvert, TypeIndex, WasmHeapTopType, WasmHeapType, WasmResult,
@@ -152,40 +153,20 @@ pub struct ModuleTranslation<'data> {
     /// For each imported global, memory, or table, the single statically-known
     /// defined entity that always satisfies that import, if any.
     ///
-    /// This is used to access the entity via the defining module's precise
-    /// `AliasRegionKey::Defined{Global,Memory,Table}` region instead of the
-    /// conservative `AliasRegionKey::Public{Global,Memory,Table}` region that is
-    /// shared by every entity of that kind which crosses a module boundary.
+    /// This is the first of two independent axes of static knowledge about an
+    /// import: "is this import always satisfied by the same defined entity?"
+    /// See [`Self::imported_globals_known_to_importers`] and friends for the
+    /// second axis.
     ///
-    /// XXX: Being "known" requires more here than it does for functions: it is
-    /// not enough that *this* module's import is always the same entity,
-    /// *every* module that may import that entity must also always import that
-    /// same entity. Otherwise a function from one of those other modules, which
-    /// accesses the entity via the conservative region, could be inlined next
-    /// to one of our accesses via the precise region, and accessing the same
-    /// memory through two different alias regions is invalid.
+    /// Optimizations that consume this map may rely on it alone, without the
+    /// second axis. For example, when the import of an immutable global is
+    /// always a particular defined global, that global's value can be inlined
+    /// at each `global.get` of the import (see
+    /// [`Self::imported_global_values`]), regardless of what any other module
+    /// does or does not know about that global.
     ///
-    /// This extra condition is an artifact of this implementation, and how we
-    /// consume this data to choose the alias region for loads and stores to a
-    /// global/memory/table, not something inherent to knowing exactly which
-    /// entity satisfies a particular import. Really, there are two independent
-    /// axes here:
-    ///
-    /// 1. Is this import always satisfied by the same defined entity?
-    ///
-    /// 2. Is that entity's identity additionally known to *every* other module
-    ///    that may import it?
-    ///
-    /// Only alias regions need (2), but other theoretical optimizations could
-    /// be perfectly happy with just (1). For example, if we know that an import
-    /// of an immutable global is always a particular defined global, then we
-    /// could inline that global's value at each `global.get` of the import,
-    /// regardless what any other module does or does not know about that
-    /// global.
-    ///
-    /// TODO(#14164): Actually record (1) and (2) in separate maps, enabling
-    /// optimizations that rely on just (1) but not (2), instead of folding them
-    /// into this same map.
+    /// This can only be determined by looking at the whole component, so it is
+    /// always `None` for standalone modules.
     pub known_imported_globals: SecondaryMap<GlobalIndex, Option<KnownGlobal>>,
 
     /// Same as `known_imported_globals`, but for memories.
@@ -193,6 +174,51 @@ pub struct ModuleTranslation<'data> {
 
     /// Same as `known_imported_globals`, but for tables.
     pub known_imported_tables: SecondaryMap<TableIndex, Option<KnownEntity<DefinedTableIndex>>>,
+
+    /// For each imported global, memory, or table, whether the defined entity
+    /// that always satisfies that import is additionally statically known to
+    /// *every* other module that may import it.
+    ///
+    /// This is the second of the two axes: "is that thing always known to all
+    /// other modules as well?" While the first axis (see
+    /// [`Self::known_imported_globals`] and friends) only talks about *this*
+    /// module's imports, this one is a property of the whole component and of
+    /// the entity itself, and it is exactly the importing-side counterpart of
+    /// [`Self::globals_known_to_importers`] and friends on the defining module.
+    ///
+    /// Only these imports may access their entity via the defining module's
+    /// precise `AliasRegionKey::Defined{Global,Memory,Table}` region instead
+    /// of the conservative `AliasRegionKey::Public{Global,Memory,Table}`
+    /// region shared by every entity of that kind which crosses a module
+    /// boundary. Otherwise a function from a module that accesses the entity
+    /// via the conservative region could be inlined next to one of our
+    /// accesses via the precise region, and accessing the same memory through
+    /// two different alias regions is invalid.
+    ///
+    /// This can only be determined by looking at the whole component, so it is
+    /// always empty for standalone modules.
+    pub imported_globals_known_to_importers: EntitySet<GlobalIndex>,
+
+    /// Same as [`Self::imported_globals_known_to_importers`], but for memories.
+    pub imported_memories_known_to_importers: EntitySet<MemoryIndex>,
+
+    /// Same as [`Self::imported_globals_known_to_importers`], but for tables.
+    pub imported_tables_known_to_importers: EntitySet<TableIndex>,
+
+    /// For each imported global, the constant value that import always has,
+    /// when the first axis of static knowledge holds (see
+    /// [`Self::known_imported_globals`]) and the global is immutable with a
+    /// simple initializer.
+    ///
+    /// Because the import is always satisfied by the same defined global, and
+    /// that global is immutable and always initialized to this value, every
+    /// `global.get` of the import can simply inline the value. This does not
+    /// need the second axis of static knowledge: the value is the same no
+    /// matter which alias region any other module uses to access the global.
+    ///
+    /// This can only be determined by looking at the whole component, so it is
+    /// always `None` for standalone modules.
+    pub imported_global_values: SecondaryMap<GlobalIndex, Option<GlobalConstValue>>,
 
     /// For each global defined by this module, whether every module that may
     /// import this global always imports exactly this global.
@@ -337,6 +363,10 @@ impl<'data> ModuleTranslation<'data> {
             known_imported_globals: SecondaryMap::default(),
             known_imported_memories: SecondaryMap::default(),
             known_imported_tables: SecondaryMap::default(),
+            imported_globals_known_to_importers: EntitySet::new(),
+            imported_memories_known_to_importers: EntitySet::new(),
+            imported_tables_known_to_importers: EntitySet::new(),
+            imported_global_values: SecondaryMap::default(),
             globals_known_to_importers: EntitySet::new(),
             memories_known_to_importers: EntitySet::new(),
             tables_known_to_importers: EntitySet::new(),
