@@ -2361,19 +2361,27 @@ impl<M: ABIMachineSpec> Callee<M> {
         // might need. Note that s390x may also use the outgoing args area for
         // backtrace support even in leaf functions, so that should be accounted
         // for unconditionally.
+        //
+        // Tail calls, however, are exempt from that accounting: the callee
+        // reuses this function's own return address and setup area, which the
+        // caller already accounted for on this function's behalf, and this
+        // function's frame is released before the callee's prologue runs. A
+        // function whose only calls are tail calls therefore needs no check at
+        // all when it has no stack usage of its own.
         let total_stacksize = (frame_layout.tail_args_size - frame_layout.incoming_args_size)
             + frame_layout.clobber_size
             + frame_layout.fixed_frame_storage_size
             + frame_layout.outgoing_args_size
-            + if frame_layout.function_calls == FunctionCalls::None {
-                0
-            } else {
+            + if frame_layout.function_calls == FunctionCalls::Regular {
                 frame_layout.setup_area_size
+            } else {
+                0
             };
 
         // Leaf functions with zero stack don't need a stack check if one's
-        // specified, otherwise always insert the stack check.
-        if total_stacksize > 0 || frame_layout.function_calls != FunctionCalls::None {
+        // specified, and neither do functions which only make tail calls (see
+        // above), otherwise always insert the stack check.
+        if total_stacksize > 0 || frame_layout.function_calls == FunctionCalls::Regular {
             if let Some((reg, stack_limit_load)) = &self.stack_limit {
                 insts.extend(stack_limit_load.clone());
                 self.insert_stack_check(*reg, total_stacksize, &mut insts);

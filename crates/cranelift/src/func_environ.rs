@@ -2632,15 +2632,18 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
         self,
         sig_ref: ir::SigRef,
         callee: ir::Value,
+        callee_ty: WasmRefType,
         args: &[ir::Value],
     ) -> WasmResult<CallRets> {
-        // FIXME: the wasm type system tracks enough information to know whether
-        // `callee` is a null reference or not. In some situations it can be
-        // statically known here that `callee` cannot be null in which case this
-        // can be `None` instead. This requires feeding type information from
-        // wasmparser's validator into this function, however, which is not
-        // easily done at this time.
-        let callee_load_trap_code = Some(crate::TRAP_NULL_REFERENCE);
+        // If the callee's static type says it can't be null (e.g. it's known to
+        // come from a non-nullable global, table, or `ref.func`), then the
+        // loads below can't trap. Otherwise a null callee must trap with a
+        // null-reference error when it's dereferenced.
+        let callee_load_trap_code = if callee_ty.nullable {
+            Some(crate::TRAP_NULL_REFERENCE)
+        } else {
+            None
+        };
 
         self.unchecked_call(sig_ref, callee, callee_load_trap_code, args)
     }
@@ -3834,9 +3837,10 @@ impl FuncEnvironment<'_> {
         srcloc: ir::SourceLoc,
         sig_ref: ir::SigRef,
         callee: ir::Value,
+        callee_ty: WasmRefType,
         call_args: &[ir::Value],
     ) -> WasmResult<CallRets> {
-        Call::new(builder, self, srcloc).call_ref(sig_ref, callee, call_args)
+        Call::new(builder, self, srcloc).call_ref(sig_ref, callee, callee_ty, call_args)
     }
 
     pub fn translate_return_call(
@@ -3878,9 +3882,10 @@ impl FuncEnvironment<'_> {
         srcloc: ir::SourceLoc,
         sig_ref: ir::SigRef,
         callee: ir::Value,
+        callee_ty: WasmRefType,
         call_args: &[ir::Value],
     ) -> WasmResult<()> {
-        Call::new_tail(builder, self, srcloc).call_ref(sig_ref, callee, call_args)?;
+        Call::new_tail(builder, self, srcloc).call_ref(sig_ref, callee, callee_ty, call_args)?;
         Ok(())
     }
 

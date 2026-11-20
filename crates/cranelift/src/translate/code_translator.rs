@@ -858,12 +858,15 @@ pub fn translate_operator(
             let sigref = environ.get_or_create_sig_ref(builder.func, type_index);
             let num_args = environ.num_params_for_function_type(type_index);
             let callee = environ.stacks.pop1();
+            let [.., WasmValType::Ref(callee_ty)] = operand_types else {
+                unreachable!("validation")
+            };
 
             // Bitcast any vector arguments to their default type, I8X16, before calling.
             let mut args = environ.stacks.peekn(num_args).to_vec();
             bitcast_wasm_params(environ, sigref, &mut args, builder);
 
-            environ.translate_return_call_ref(builder, srcloc, sigref, callee, &args)?;
+            environ.translate_return_call_ref(builder, srcloc, sigref, callee, *callee_ty, &args)?;
 
             environ.stacks.popn(num_args);
             environ.stacks.reachable = false;
@@ -2737,13 +2740,22 @@ pub fn translate_operator(
             let sigref = environ.get_or_create_sig_ref(builder.func, type_index);
             let num_args = environ.num_params_for_function_type(type_index);
             let callee = environ.stacks.pop1();
+            let [.., WasmValType::Ref(callee_ty)] = operand_types else {
+                unreachable!("validation")
+            };
 
             // Bitcast any vector arguments to their default type, I8X16, before calling.
             let mut args = environ.stacks.peekn(num_args).to_vec();
             bitcast_wasm_params(environ, sigref, &mut args, builder);
 
-            let inst_results =
-                environ.translate_call_ref(builder, environ.next_srcloc, sigref, callee, &args)?;
+            let inst_results = environ.translate_call_ref(
+                builder,
+                environ.next_srcloc,
+                sigref,
+                callee,
+                *callee_ty,
+                &args,
+            )?;
 
             debug_assert_eq!(
                 inst_results.len(),

@@ -1,0 +1,151 @@
+test compile precise-output
+set unwind_info=false
+set preserve_frame_pointers=true
+target x86_64
+
+;; Functions which only make tail calls are effectively leaf functions: their
+;; frame is handed back to the callee before its prologue runs, so the stack
+;; limit check in the caller already covers everything the callee may push.
+;; Only functions making regular calls need to account for the callee's setup
+;; area.
+
+function %callee() -> i64 tail {
+block0:
+    v0 = iconst.i64 42
+    return v0
+}
+
+; VCode:
+;   pushq %rbp
+;   movq %rsp, %rbp
+; block0:
+;   movl $0x2a, %eax
+;   movq %rbp, %rsp
+;   popq %rbp
+;   retq
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   pushq %rbp
+;   movq %rsp, %rbp
+; block1: ; offset 0x4
+;   movl $0x2a, %eax
+;   movq %rbp, %rsp
+;   popq %rbp
+;   retq
+
+function %tail_call_zero_stack(i64 vmctx) -> i64 tail {
+    gv0 = vmctx
+    gv1 = load.i64 notrap aligned gv0
+    gv2 = load.i64 notrap aligned gv1+4
+    stack_limit = gv2
+    fn0 = colocated %callee() -> i64 tail
+
+block0(v0: i64):
+    return_call fn0()
+}
+
+; VCode:
+;   pushq %rbp
+;   movq %rsp, %rbp
+; block0:
+;   return_call_known TestCase(%callee) (0) tmp=%r11
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   pushq %rbp
+;   movq %rsp, %rbp
+; block1: ; offset 0x4
+;   movq %rbp, %rsp
+;   popq %rbp
+;   jmp 0xd ; reloc_external CallPCRel4 %callee -4
+
+;; A tail call which needs to grow the argument area still requires a check
+;; covering that growth, but no longer includes the callee's setup area.
+
+function %tail_call_stack_usage(i64 vmctx) -> i64 tail {
+    gv0 = vmctx
+    gv1 = load.i64 notrap aligned gv0
+    gv2 = load.i64 notrap aligned gv1+4
+    stack_limit = gv2
+    fn0 = colocated %callee() -> i64 tail
+    ss0 = explicit_slot 16
+
+block0(v0: i64):
+    return_call fn0()
+}
+
+; VCode:
+;   pushq %rbp
+;   movq %rsp, %rbp
+;   movq (%rdi), %r10
+;   movq 4(%r10), %r10
+;   addq $0x10, %r10
+;   cmpq %rsp, %r10
+;   jnbe #trap=stk_ovf
+;   subq $0x10, %rsp
+; block0:
+;   return_call_known TestCase(%callee) (0) tmp=%r11
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   pushq %rbp
+;   movq %rsp, %rbp
+;   movq (%rdi), %r10
+;   movq 4(%r10), %r10
+;   addq $0x10, %r10
+;   cmpq %rsp, %r10
+;   ja 0x29
+;   subq $0x10, %rsp
+; block1: ; offset 0x1c
+;   addq $0x10, %rsp
+;   movq %rbp, %rsp
+;   popq %rbp
+;   jmp 0x29 ; reloc_external CallPCRel4 %callee -4
+;   ud2 ; trap: stk_ovf
+
+;; Regular calls keep the old behavior: the callee's setup area must be
+;; accounted for.
+
+function %regular_call_zero_stack(i64 vmctx) -> i64 tail {
+    gv0 = vmctx
+    gv1 = load.i64 notrap aligned gv0
+    gv2 = load.i64 notrap aligned gv1+4
+    stack_limit = gv2
+    fn0 = colocated %callee() -> i64 tail
+
+block0(v0: i64):
+    v1 = call fn0()
+    return v1
+}
+
+; VCode:
+;   pushq %rbp
+;   movq %rsp, %rbp
+;   movq (%rdi), %r10
+;   movq 4(%r10), %r10
+;   addq $0x10, %r10
+;   cmpq %rsp, %r10
+;   jnbe #trap=stk_ovf
+; block0:
+;   call    TestCase(%callee)
+;   movq %rbp, %rsp
+;   popq %rbp
+;   retq
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   pushq %rbp
+;   movq %rsp, %rbp
+;   movq (%rdi), %r10
+;   movq 4(%r10), %r10
+;   addq $0x10, %r10
+;   cmpq %rsp, %r10
+;   ja 0x22
+; block1: ; offset 0x18
+;   callq 0x1d ; reloc_external CallPCRel4 %callee -4
+;   movq %rbp, %rsp
+;   popq %rbp
+;   retq
+;   ud2 ; trap: stk_ovf
+

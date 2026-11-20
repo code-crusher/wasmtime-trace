@@ -1782,6 +1782,73 @@ fn return_call_indirect_to_imported_function(config: &mut Config) -> Result<()> 
     Ok(())
 }
 
+#[wasmtime_test(wasm_features(tail_call, function_references))]
+fn call_ref_of_non_null_references(config: &mut Config) -> Result<()> {
+    let engine = Engine::new(config)?;
+
+    // The callee of `call_ref`/`return_call_ref` is statically known to be
+    // non-null when it's loaded from a non-nullable global or table, in which
+    // case no null check is emitted. Exercise both the checked and unchecked
+    // paths here, along with the tail-call and non-tail-call variants, to be
+    // sure the codegen ends up correct.
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+              (type $t (func (result i32)))
+              (global $g (ref $t) (ref.func $f))
+              (global $gn (mut (ref null $t)) (ref.func $f))
+              (table $t 1 1 (ref $t) (ref.func $f))
+              (func $f (result i32) (i32.const 42))
+
+              (func (export "non_null_call_ref") (result i32)
+                (call_ref $t (global.get $g)))
+
+              (func (export "non_null_return_call_ref") (result i32)
+                (return_call_ref $t (global.get $g)))
+
+              (func (export "non_null_call_ref_table") (result i32)
+                (call_ref $t (table.get $t (i32.const 0))))
+
+              (func (export "nullable_call_ref") (result i32)
+                (call_ref $t (global.get $gn)))
+
+              (func (export "nullable_return_call_ref") (result i32)
+                (return_call_ref $t (global.get $gn)))
+
+              (func (export "set_null") (global.set $gn (ref.null $t)))
+            )
+        "#,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    // A non-null callee works, with or without a null check.
+    for name in [
+        "non_null_call_ref",
+        "non_null_return_call_ref",
+        "non_null_call_ref_table",
+        "nullable_call_ref",
+        "nullable_return_call_ref",
+    ] {
+        let f = instance.get_typed_func::<(), i32>(&mut store, name)?;
+        assert_eq!(f.call(&mut store, ())?, 42);
+    }
+
+    // A null callee traps, with or without a tail call.
+    instance
+        .get_typed_func::<(), ()>(&mut store, "set_null")?
+        .call(&mut store, ())?;
+    for name in ["nullable_call_ref", "nullable_return_call_ref"] {
+        let f = instance.get_typed_func::<(), i32>(&mut store, name)?;
+        let err = f.call(&mut store, ()).unwrap_err();
+        err.assert_contains("null function reference");
+    }
+
+    Ok(())
+}
+
 #[wasmtime_test(wasm_features(tail_call))]
 fn return_call_to_aborting_wasm_function_with_stack_adjustments(config: &mut Config) -> Result<()> {
     let engine = Engine::new(config)?;

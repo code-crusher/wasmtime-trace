@@ -20,7 +20,7 @@
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i64):
-;; @001e                               v3 = load.i64 user16 aligned readonly region2 v2+8
+;; @001e                               v3 = load.i64 notrap aligned readonly region2 v2+8
 ;; @001e                               v4 = load.i64 notrap aligned readonly region3 v2+24
 ;; @001e                               call_indirect sig0, v3(v4, v0)
 ;; @0022                               call_indirect sig0, v3(v4, v0)
