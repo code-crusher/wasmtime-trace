@@ -757,18 +757,14 @@ impl Config {
     /// epoch deadlines to limit the execution time of untrusted code.
     ///
     /// Note, though, that a current limitation to this is that
-    /// bulk-data-transfer instructions, such as `memory.copy`, only check the
-    /// epoch once at the start of the operation. These operations can take a
-    /// variable amount of time to complete based on how many bytes are being
-    /// copied. This means that the maximal time slice a guest might take is
-    /// the maximum of the epoch interval and the largest
-    /// memory-copy-style-instruction executed. The size of a copy is bounded
-    /// on the size of linear memory or GC heap size. In the limit, however, a
-    /// guest using a 64-bit linear memory with a 128GiB size could issue a
-    /// 128GiB `memory.copy` which would have no preemption within the
-    /// instruction itself. Hosts which need strict time limits for guests right
-    /// now are recommended to ensure that the store's allocated heap size
-    /// (linear memory + GC heap) are bounded with a
+    /// bulk-data-transfer instructions, such as `memory.copy`, check the
+    /// epoch once per 128MiB transferred rather than once per
+    /// instruction. An epoch deadline can therefore be overshot by up to
+    /// about the time a 128MiB copy takes, which bounds the time a guest
+    /// can extend its timeslice past the deadline. Hosts which need
+    /// stricter time limits for guests are additionally recommended to
+    /// ensure that the store's allocated heap size (linear memory + GC
+    /// heap) are bounded with a
     /// [`ResourceLimiter`](crate::ResourceLimiter).
     ///
     /// ## When to use fuel vs. epochs

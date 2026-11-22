@@ -4104,7 +4104,16 @@ impl FuncEnvironment<'_> {
         let cost = self.tunables.operator_cost.variable().memory_copy_per_byte;
         let fuel = self.pre_translate_bulk_op(builder, len, cost);
         self.watch_range(builder, dst_index, dst, len);
-        self.translate_entity_copy(builder, dst_index, src_index, dst, src, len)?;
+        self.translate_preemptible_memory_bulk_op(
+            builder,
+            MemoryBulkOpKind::Copy {
+                dst: dst_index,
+                src: src_index,
+            },
+            dst,
+            src,
+            len,
+        )?;
         self.post_translate_bulk_op(builder, fuel)
     }
 
@@ -4161,6 +4170,278 @@ impl FuncEnvironment<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Emits one complete linear-memory bulk operation of `len` units at
+    /// `dst`/`src`, with its own bounds checks.
+    ///
+    /// This is used both to emit a whole operation in one piece and to emit
+    /// each chunk of the chunked, preemptible loop in
+    /// [`Self::translate_preemptible_memory_bulk_op`].
+    fn emit_memory_bulk_op(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        kind: &MemoryBulkOpKind,
+        dst: ir::Value,
+        src: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        match *kind {
+            MemoryBulkOpKind::Copy { dst: d, src: s } => {
+                self.translate_entity_copy(builder, d, s, dst, src, len)
+            }
+            MemoryBulkOpKind::Fill { dst: d, .. } => {
+                self.translate_entity_fill(builder, d, dst, kind.fill_value(), len)
+            }
+            MemoryBulkOpKind::Init { dst: d, seg } => self.translate_entity_copy(
+                builder,
+                d,
+                CheckedEntity::Data {
+                    segment: seg,
+                    element_size: 1,
+                },
+                dst,
+                src,
+                len,
+            ),
+        }
+    }
+
+    /// Emits the linear-memory bulk operation described by `kind` on the full
+    /// range `dst`..`dst + len` (and `src`..`src + len` for copies and inits).
+    ///
+    /// `dst`, `src`, and `len` are the original, wasm-level operands, in the
+    /// types that the wasm module supplied them in.
+    ///
+    /// When epoch-based interruption is enabled, an operation that may be
+    /// larger than [`PREEMPTIBLE_BULK_MEMORY_CHUNK_SIZE`] units is instead
+    /// emitted as a loop over chunks of at most that many units, with an epoch
+    /// check before each chunk. This restores preemption points in the middle
+    /// of large bulk operations, which bounds the time a guest can extend its
+    /// timeslice with, e.g., a multi-gigabyte `memory.copy`; see
+    /// <https://github.com/bytecodealliance/wasmtime/issues/14047>.
+    ///
+    /// This is done by splitting the operation into a sequence of smaller,
+    /// complete, individually-bounds-checked bulk operations rather than by
+    /// chunking the memcpy itself. That sidesteps the problems that caused the
+    /// mid-operation preemption points of Wasmtime 46.0.0 to be reverted in
+    /// #14045:
+    ///
+    /// * No pointers are live across a preemption point. The loop carries the
+    ///   original wasm-level indices, which stay valid if the memory is grown
+    ///   (and possibly moved) while preempted, and each chunk re-derives its
+    ///   raw pointers from the memory's `VMMemoryDefinition` after the epoch
+    ///   check.
+    ///
+    /// * Each chunk leaves the store in a valid, guest-observable state: it is
+    ///   exactly the state the guest could produce itself with a sequence of
+    ///   bulk operations. Nothing (like a grown-but-uninitialized table) is
+    ///   visible that wasm itself could not observe.
+    ///
+    /// * The whole range is bounds-checked up front, exactly as a single
+    ///   fused operation would be, so a trapping operation still traps before
+    ///   any bytes are written.
+    ///
+    /// Chunks of an overlapping copy must proceed in the right direction
+    /// relative to the overlap (`memcpy` semantics within each chunk do not
+    /// help across chunks), so `memory.copy` within one memory picks a
+    /// direction once, up front, and walks either forwards or backwards. The
+    /// direction is a plain boolean, so it too is safe to carry across a
+    /// preemption point: growth moves a memory's base but does not change the
+    /// relative position of the source and destination ranges.
+    ///
+    /// Note that only the epoch check is performed between chunks. Fuel for
+    /// the whole operation is still charged once, after it completes, by
+    /// [`Self::post_translate_bulk_op`]: unlike epochs, fuel is a
+    /// deterministic budget, and its total consumption must not depend on how
+    /// the operation happened to be chunked.
+    fn translate_preemptible_memory_bulk_op(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        kind: MemoryBulkOpKind,
+        dst: ir::Value,
+        src: ir::Value,
+        len: ir::Value,
+    ) -> WasmResult<()> {
+        // Without epoch-based interruption there is nothing to preempt, and
+        // the operation is emitted exactly as it was before this loop existed.
+        if !self.tunables.epoch_interruption {
+            return self.emit_memory_bulk_op(builder, &kind, dst, src, len);
+        }
+
+        const CHUNK: u64 = PREEMPTIBLE_BULK_MEMORY_CHUNK_SIZE;
+
+        // Operations that statically fit in a single chunk never need the
+        // loop.
+        let const_len = Self::value_as_const_int(builder, len);
+        if const_len.is_some_and(|len| len <= CHUNK) {
+            return self.emit_memory_bulk_op(builder, &kind, dst, src, len);
+        }
+
+        // Block layout:
+        //
+        //     current: [brif len <= CHUNK, direct, setup]   (dynamic lengths)
+        //     direct:  one whole operation; jump done
+        //     setup:   full-range bounds check; jump loop   (== current when
+        //              the length is a constant known to exceed a chunk)
+        //     loop(remaining, dst_cur, src_cur): epoch check; one chunk
+        //              operation; brif remaining, loop, done
+        //     done:
+        let len_ty = builder.func.dfg.value_type(len);
+        let dst_ty = builder.func.dfg.value_type(dst);
+        let src_ty = builder.func.dfg.value_type(src);
+        let current_block = builder.current_block().unwrap();
+        let loop_block = builder.create_block();
+        let done_block = builder.create_block();
+        builder.ensure_inserted_block();
+        builder.insert_block_after(loop_block, current_block);
+        builder.insert_block_after(done_block, loop_block);
+
+        // Runtime lengths take a single copy either way: only lengths that
+        // exceed a chunk at runtime pay for the loop. (A constant length
+        // known to exceed a chunk skips this and falls straight through to
+        // the setup code below.)
+        if const_len.is_none() {
+            let direct_block = builder.create_block();
+            let setup_block = builder.create_block();
+            builder.insert_block_after(direct_block, current_block);
+            builder.insert_block_after(setup_block, direct_block);
+            let chunk = builder.ins().iconst(len_ty, CHUNK.cast_signed());
+            let small = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, len, chunk);
+            builder
+                .ins()
+                .brif(small, direct_block, &[], setup_block, &[]);
+            builder.seal_block(direct_block);
+            builder.switch_to_block(direct_block);
+            self.emit_memory_bulk_op(builder, &kind, dst, src, len)?;
+            builder.ins().jump(done_block, &[]);
+            builder.seal_block(setup_block);
+            builder.switch_to_block(setup_block);
+        }
+
+        // Bounds-check the whole range up front, exactly as a single fused
+        // operation would, so that a trapping operation writes no bytes at
+        // all even though the writes below happen one chunk at a time.
+        let dst_idx_ty = self.memory(kind.dst_memory()).idx_type;
+        let src_entity = kind.src_entity();
+        let src_idx_ty = match src_entity {
+            Some(src_entity) => src_entity.index_type(self),
+            // A fill has no source range; the `src` operand is a dummy
+            // `dst`-typed value that nothing below reads.
+            None => dst_idx_ty,
+        };
+        let dst_len = Self::widen_to_index_type(builder, len, len_ty, dst_idx_ty);
+        self.translate_entity_bounds_check(builder, kind.dst_memory(), dst, dst_len)?;
+        if let Some(src_entity) = src_entity {
+            let src_len = Self::widen_to_index_type(builder, len, len_ty, src_idx_ty);
+            self.translate_entity_bounds_check(builder, src_entity, src, src_len)?;
+        }
+
+        // For a copy within one memory the chunks must walk backwards when
+        // the destination overlaps the source from above; see the method
+        // docs. The direction is decided once, here, and the loop body
+        // selects between the two walks' positions at runtime.
+        let backwards = kind
+            .copies_within_one_memory()
+            .then(|| builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, dst, src));
+
+        // Enter the loop. The loop carries the remaining length plus the
+        // current source and destination positions, all as wasm-level
+        // indices: they stay valid if the memory is grown while preempted.
+        // The cursors stay at the front of the remaining range in both
+        // directions; a backwards walk computes each chunk's start from
+        // `remaining`, which keeps every intermediate value strictly inside
+        // the (in-bounds, pre-checked) range even for a full 4GiB copy.
+        builder
+            .ins()
+            .jump(loop_block, &[len.into(), dst.into(), src.into()]);
+        builder.switch_to_block(loop_block);
+        let remaining = builder.append_block_param(loop_block, len_ty);
+        let dst_cur = builder.append_block_param(loop_block, dst_ty);
+        let src_cur = builder.append_block_param(loop_block, src_ty);
+
+        // Preempt before the next chunk. This may trap or suspend execution
+        // (e.g. to yield to an async executor); everything live across it is
+        // a wasm-level index or a boolean.
+        self.epoch_check(builder);
+
+        // This chunk covers the next `chunk` units of the remaining range,
+        // taken from the front of the range forwards, or from its end
+        // backwards.
+        let chunk = {
+            let max = builder.ins().iconst(len_ty, CHUNK.cast_signed());
+            builder.ins().umin(remaining, max)
+        };
+        let chunk_dst = Self::widen_to_index_type(builder, chunk, len_ty, dst_idx_ty);
+        let (chunk_dst, chunk_src, next_dst, next_src) = match backwards {
+            // Forwards: operate on the first `chunk` units and advance.
+            None => {
+                let chunk_src = Self::widen_to_index_type(builder, chunk, len_ty, src_idx_ty);
+                let next_dst = builder.ins().iadd(dst_cur, chunk_dst);
+                let next_src = builder.ins().iadd(src_cur, chunk_src);
+                (dst_cur, src_cur, next_dst, next_src)
+            }
+            // A copy within one memory picks its direction at runtime. Both
+            // walks' positions are computed and one is discarded: every
+            // candidate is inside the range that was bounds-checked above
+            // (a forwards `next` may wrap past the end of a full 4GiB memory
+            // on the very last chunk, but a wrapped candidate is discarded
+            // and `remaining` is zero then, so it is never used). Only a
+            // copy within one memory gets here, so `dst`, `src`, and `len`
+            // all share one type and no widening is needed.
+            Some(backwards) => {
+                debug_assert_eq!(len_ty, dst_ty);
+                debug_assert_eq!(len_ty, src_ty);
+                let zero = builder.ins().iconst(len_ty, 0);
+                let tail = builder.ins().isub(remaining, chunk);
+                let pos = builder.ins().select(backwards, tail, zero);
+                let advance = builder.ins().select(backwards, zero, chunk);
+                let pos_dst = builder.ins().iadd(dst_cur, pos);
+                let pos_src = builder.ins().iadd(src_cur, pos);
+                let next_dst = builder.ins().iadd(dst_cur, advance);
+                let next_src = builder.ins().iadd(src_cur, advance);
+                (pos_dst, pos_src, next_dst, next_src)
+            }
+        };
+        self.emit_memory_bulk_op(builder, &kind, chunk_dst, chunk_src, chunk)?;
+
+        // Continue while there is more of the range left.
+        let remaining = builder.ins().isub(remaining, chunk);
+        let more = builder.ins().icmp_imm_s(IntCC::NotEqual, remaining, 0);
+        builder.ins().brif(
+            more,
+            loop_block,
+            &[remaining.into(), next_dst.into(), next_src.into()],
+            done_block,
+            &[],
+        );
+
+        builder.seal_block(loop_block);
+        builder.seal_block(done_block);
+        builder.switch_to_block(done_block);
+        Ok(())
+    }
+
+    /// Widens `val` from `len_ty` to `ty`, if needed.
+    ///
+    /// This is used to extend a chunk length, which is computed in the
+    /// operation's length type, to the (possibly wider) index type of each
+    /// entity the operation touches. The value always fits: a chunk is at
+    /// most [`PREEMPTIBLE_BULK_MEMORY_CHUNK_SIZE`], and in-bounds positions
+    /// are at most the size of a memory, which fits its own index type.
+    fn widen_to_index_type(
+        builder: &mut FunctionBuilder<'_>,
+        val: ir::Value,
+        val_ty: ir::Type,
+        ty: IndexType,
+    ) -> ir::Value {
+        match (val_ty, index_type_to_ir_type(ty)) {
+            (I32, I32) | (I64, I64) => val,
+            (I32, I64) => builder.ins().uextend(I64, val),
+            (I64, I32) => unreachable!("cannot narrow an index"),
+            // Only `I32`/`I64` are used as wasm index types.
+            _ => unreachable!("unexpected index types"),
+        }
     }
 
     /// Emits a generic "fill" of `entity` from `dst` for `len` elements,
@@ -4439,7 +4720,19 @@ impl FuncEnvironment<'_> {
         let cost = self.tunables.operator_cost.variable().memory_fill_per_byte;
         let fuel = self.pre_translate_bulk_op(builder, len, cost);
         self.watch_range(builder, memory_index, dst, len);
-        self.translate_entity_fill(builder, memory_index, dst, val, len)?;
+        // A fill has no source range; `dst` is passed as the `src` operand
+        // only to give the chunk loop a value of the right type, and is
+        // ignored by `emit_memory_bulk_op` for fills.
+        self.translate_preemptible_memory_bulk_op(
+            builder,
+            MemoryBulkOpKind::Fill {
+                dst: memory_index,
+                val,
+            },
+            dst,
+            /* src */ dst,
+            len,
+        )?;
         self.post_translate_bulk_op(builder, fuel)
     }
 
@@ -4456,12 +4749,11 @@ impl FuncEnvironment<'_> {
         let cost = self.tunables.operator_cost.variable().memory_init_per_byte;
         let fuel = self.pre_translate_bulk_op(builder, len, cost);
         self.watch_range(builder, memory_index, dst, len);
-        self.translate_entity_copy(
+        self.translate_preemptible_memory_bulk_op(
             builder,
-            memory_index,
-            CheckedEntity::Data {
-                segment: seg_index,
-                element_size: 1,
+            MemoryBulkOpKind::Init {
+                dst: memory_index,
+                seg: seg_index,
             },
             dst,
             src,
@@ -6882,6 +7174,72 @@ enum BulkOp {
         val: ir::Value,
         len: ir::Value,
     },
+}
+
+/// The maximum number of bytes processed by a single chunk of a preemptible
+/// bulk memory operation; see
+/// [`FuncEnvironment::translate_preemptible_memory_bulk_op`].
+///
+/// Each chunk is copied with a single `memcpy`, so this bounds the amount of
+/// time a guest can extend its timeslice past an epoch deadline. The value is
+/// a tradeoff: large enough that the per-chunk overhead (an epoch check, a
+/// bounds check, and a libcall) is amortized away for large copies, small
+/// enough that a chunk takes on the order of milliseconds to copy.
+const PREEMPTIBLE_BULK_MEMORY_CHUNK_SIZE: u64 = 128 << 20;
+
+/// Which linear-memory bulk operation
+/// [`FuncEnvironment::translate_preemptible_memory_bulk_op`] is emitting, and
+/// the entities it operates on.
+#[derive(Clone, Copy)]
+enum MemoryBulkOpKind {
+    /// `memory.copy` from the `src` memory into the `dst` memory.
+    Copy { dst: MemoryIndex, src: MemoryIndex },
+    /// `memory.fill` on the `dst` memory.
+    Fill { dst: MemoryIndex, val: ir::Value },
+    /// `memory.init` from the `seg` data segment into the `dst` memory.
+    Init { dst: MemoryIndex, seg: DataIndex },
+}
+
+impl MemoryBulkOpKind {
+    /// The destination memory of this operation.
+    fn dst_memory(&self) -> MemoryIndex {
+        match *self {
+            MemoryBulkOpKind::Copy { dst, .. }
+            | MemoryBulkOpKind::Fill { dst, .. }
+            | MemoryBulkOpKind::Init { dst, .. } => dst,
+        }
+    }
+
+    /// The fill value written by `memory.fill`; panics for other operations.
+    fn fill_value(&self) -> ir::Value {
+        match *self {
+            MemoryBulkOpKind::Fill { val, .. } => val,
+            _ => unreachable!("only `memory.fill` has a fill value"),
+        }
+    }
+
+    /// The source entity of this operation, if it isn't a fill.
+    fn src_entity(&self) -> Option<CheckedEntity> {
+        match *self {
+            MemoryBulkOpKind::Copy { src, .. } => Some(CheckedEntity::Memory(src)),
+            MemoryBulkOpKind::Init { seg, .. } => Some(CheckedEntity::Data {
+                segment: seg,
+                element_size: 1,
+            }),
+            MemoryBulkOpKind::Fill { .. } => None,
+        }
+    }
+
+    /// Do the source and destination ranges of this operation live in the same
+    /// linear memory, such that they may overlap? Only a `memory.copy` from a
+    /// memory into itself can overlap; `memory.fill` writes a constant, and
+    /// `memory.init` reads from passive data outside the memory.
+    fn copies_within_one_memory(&self) -> bool {
+        match *self {
+            MemoryBulkOpKind::Copy { dst, src } => dst == src,
+            MemoryBulkOpKind::Fill { .. } | MemoryBulkOpKind::Init { .. } => false,
+        }
+    }
 }
 
 /// A list of entities which can participate in various kinds of bulk operations
