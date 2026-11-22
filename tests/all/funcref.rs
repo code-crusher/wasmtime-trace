@@ -135,3 +135,53 @@ fn func_new_returns_wrong_store() -> wasmtime::Result<()> {
         }
     }
 }
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn call_indirect_subtypes_without_gc_store() -> wasmtime::Result<()> {
+    // A `call_indirect` through a plain-`funcref` table with non-final
+    // function types compiles to a runtime signature check that bottoms out
+    // in the `is_subtype` libcall, and `ref.test` on typed function
+    // references does the same. Neither of these instructions needs any GC
+    // object, so Wasmtime does not allocate a GC heap for a module like
+    // this and the libcall runs on a store with no `GcStore` at all.
+    //
+    // That is why the store-local subtype-check cache (see
+    // `StoreGcData::subtype_check_cache`) can't be moved into the
+    // `GcStore` as part of #13862: unlike `gc_roots_list`, which is only
+    // touched in the middle of a collection when a `GcStore` is guaranteed
+    // to exist, this cache is reached before any `GcStore` is (ever)
+    // allocated. This test pins down that invariant: if the cache ever
+    // moves into the `GcStore`, this test will panic with an "attempted to
+    // access the store's GC heap before it has been allocated" error.
+    let wat = r#"
+        (module
+          (type $sup (sub (func (param i32) (result i32))))
+          (type $sub (sub $sup (func (param i32) (result i32))))
+          (func $f (type $sub) (local.get 0))
+          (table $t 1 funcref)
+          (elem (table $t) (i32.const 0) func $f)
+          (func (export "call") (param i32) (result i32)
+            (call_indirect (type $sup) (local.get 0) (i32.const 0)))
+        )
+    "#;
+    let mut config = Config::new();
+    config.wasm_function_references(true);
+    config.wasm_gc(true);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, wat)?;
+    let mut store = Store::new(&engine, ());
+    assert_eq!(store.gc_heap_capacity(), 0);
+    let instance = Instance::new(&mut store, &module, &[])?;
+    assert_eq!(store.gc_heap_capacity(), 0);
+
+    // The callee's type (`$sub`) differs from the call site's expected type
+    // (`$sup`), so the check can't be satisfied by the fast-path equality
+    // comparison and the `is_subtype` libcall actually runs here.
+    let call = instance.get_typed_func::<i32, i32>(&mut store, "call")?;
+    assert_eq!(call.call(&mut store, 42)?, 42);
+
+    // The GC heap must never have been allocated by any of the above.
+    assert_eq!(store.gc_heap_capacity(), 0);
+    Ok(())
+}

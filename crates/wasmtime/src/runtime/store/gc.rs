@@ -24,11 +24,29 @@ use core::ptr::NonNull;
 use wasmtime_environ::DefinedTagIndex;
 use wasmtime_environ::packed_option::ReservedValue;
 
+/// GC-related data that lives in a [`StoreOpaque`] outside of the lazily
+/// allocated [`GcStore`].
+///
+/// Ideally this data would live inside the `GcStore` so that stores which
+/// never allocate a GC heap wouldn't have to pay for it. That migration is
+/// tracked in #13862; see the notes on each field below for its current
+/// status.
 #[derive(Default)]
 pub(crate) struct StoreGcData {
+    /// The embedder-facing GC root set.
+    ///
+    /// Can't move into the `GcStore` (see #13862): this must exist before
+    /// any `GcStore` is allocated to root `i31ref`s and to serve
+    /// `RootScope`/`Rooted`/`OwnedRooted` on stores that never allocate a GC
+    /// heap at all. `RootSet::exit_lifo_scope` explicitly handles the
+    /// "GC references but no `GcStore`" case for `i31ref`s.
     gc_roots: RootSet,
-    gc_roots_list: GcRootsList,
     // Types for which the embedder has created an allocator for.
+    //
+    // Can't move into the `GcStore` (see #13862): this is populated when the
+    // embedder defines host GC types (for example `ArrayType::new`), which
+    // happens before any `GcStore` exists. Callers would have to switch to
+    // `ensure_gc_store` and become `async` for this to work.
     gc_host_alloc_types: StoreGcHostAllocTypes,
     /// Pending exception, if any. This is also a GC root, because it
     /// needs to be rooted somewhere between the time that a pending
@@ -43,6 +61,12 @@ pub(crate) struct StoreGcData {
     /// Also note that the underlying reference here is a `VMExnRef`, a
     /// refinement of `VMGcRef`, but rooting APIs right now make it difficult to
     /// work with that directly so this is stored as `VMGcRef` instead.
+    ///
+    /// Can't move into the `GcStore` (see #13862): writing this field goes
+    /// through `set_pending_exception`'s `write_gc_ref` barrier, and the
+    /// preexisting barrier functions all take a `&mut GcStore`, which would be
+    /// borrowed simultaneously with the field itself if the field lived
+    /// inside the `GcStore`.
     pending_exception: Option<VMGcRef>,
 
     /// A store-local cache of engine-level subtype checks.
@@ -64,6 +88,13 @@ pub(crate) struct StoreGcData {
     /// solution" where supertypes are stored inline in a compiled-code-visible
     /// location which means that a libcall isn't needed at all (nor
     /// synchronization) to determine subtype/supertype relationships.
+    ///
+    /// Note that, unlike the former `gc_roots_list` field, this cache can't
+    /// move into the `GcStore` (see #13862): the `is_subtype` libcall which
+    /// populates it is also emitted for plain-`funcref` `call_indirect`
+    /// signature checks and `ref.test` on typed function references, and
+    /// those run on stores that never allocate a `GcStore` at all. See the
+    /// `call_indirect_subtypes_without_gc_store` test in `tests/all`.
     subtype_check_cache: HashMap<u64, bool, NopHasher>,
 }
 
@@ -681,9 +712,10 @@ impl StoreOpaque {
             );
         }
 
-        // Take the GC roots out of `self` so we can borrow it mutably but still
-        // call mutable methods on `self`.
-        let mut roots = core::mem::take(&mut self.gc_data.gc_roots_list);
+        // Take the GC roots list out of the `GcStore` so we can borrow it
+        // mutably but still call mutable methods on `self` while filling it in
+        // and passing it to the `GcStore`'s collection.
+        let mut roots = core::mem::take(&mut self.gc_store.as_mut().unwrap().gc_roots_list);
 
         self.trace_roots(&mut roots, asyncness).await;
         self.gc_store
@@ -704,7 +736,7 @@ impl StoreOpaque {
 
         // Restore the GC roots for the next GC.
         roots.clear();
-        self.gc_data.gc_roots_list = roots;
+        self.gc_store.as_mut().unwrap().gc_roots_list = roots;
 
         if log::log_enabled!(log::Level::Trace) {
             let gc_store = self.gc_store.as_ref().unwrap();

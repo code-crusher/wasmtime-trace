@@ -63,6 +63,19 @@ pub struct GcStore {
     #[cfg(feature = "stack-switching")]
     pub cont_ref_table: ContRefTable,
 
+    /// The list of GC roots for this store's next collection.
+    ///
+    /// This is reused across collections to avoid reallocating on every GC:
+    /// `StoreOpaque::do_gc` temporarily takes it out of the `GcStore`, fills
+    /// it in with all of the store's roots, and then hands it back (after
+    /// clearing it) once the collection has finished.
+    ///
+    /// This is one of the former `StoreGcData` fields that could be moved
+    /// here because it is only ever touched in the middle of a collection,
+    /// at which point a `GcStore` necessarily exists. See #13862.
+    #[cfg(feature = "gc")]
+    pub gc_roots_list: GcRootsList,
+
     /// The total allocated bytes recorded after the last GC collection.
     /// `None` if no collection has been performed yet. Used by the
     /// grow-or-collect heuristic.
@@ -117,6 +130,8 @@ impl GcStore {
             func_ref_table,
             #[cfg(feature = "stack-switching")]
             cont_ref_table,
+            #[cfg(feature = "gc")]
+            gc_roots_list: GcRootsList::default(),
             last_post_gc_allocated_bytes: None,
             #[cfg(gc_zeal)]
             gc_zeal_alloc_counter,
