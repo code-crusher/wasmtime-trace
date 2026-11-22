@@ -4,16 +4,22 @@ use crate::component::func::HostFunc;
 use crate::component::instance::RuntimeImport;
 use crate::component::matching::{InstanceType, TypeChecker};
 use crate::component::types;
+use crate::component::types::ComponentItem;
 use crate::component::{
-    Component, ComponentNamedList, Instance, InstancePre, Lift, Lower, ResourceType, Val,
+    Component, ComponentExportIndex, ComponentNamedList, Instance, InstancePre, Lift, Lower,
+    ResourceType, RuntimeInstance, Val,
 };
 use crate::prelude::*;
+use crate::runtime::vm::{UncaughtException, ValRaw};
 use crate::{AsContextMut, Engine, Module, StoreContextMut};
 use alloc::sync::Arc;
 use core::marker;
 #[cfg(feature = "component-model-async")]
 use core::pin::Pin;
-use wasmtime_environ::component::{NameMap, NameMapIntern};
+use core::ptr::NonNull;
+use wasmtime_environ::component::{
+    Export, NameMap, NameMapIntern, ResourceIndex, TypeDef, TypeResourceTable,
+};
 use wasmtime_environ::{Atom, PrimaryMap, StringPool};
 
 /// A type used to instantiate [`Component`]s.
@@ -650,6 +656,140 @@ fn fill_defaults(
     Ok(())
 }
 
+/// Builds a host function which forwards all of its calls to `func`, an export
+/// of `instance`, for use with [`LinkerInstance::add_export`].
+///
+/// This is a "dynamic" host function, as with [`LinkerInstance::func_new`], so
+/// that any signature can be forwarded without knowing it at compile time. The
+/// `Val`s are lifted out of the caller, handed to `func`, and then the results
+/// are lowered into the caller again. Note that resources are represented as
+/// `ResourceAny` handles in this process, which is what makes them round-trip
+/// with the correct resource type and destructor.
+fn forward_func<T: 'static>(
+    store: &mut crate::store::StoreOpaque,
+    func: crate::component::Func,
+) -> Result<Arc<HostFunc>> {
+    // Only synchronous functions can be forwarded at this time; forwarding an
+    // `async` function would require spawning a task to wait on the callee
+    // while the caller is blocked.
+    ensure!(
+        !func.is_async(store),
+        "cannot add an async function export to a linker at this time"
+    );
+
+    // Note that the `Func` here is `Copy` and validated against the store when
+    // it's used, which is what lets it be moved into the closure below. That
+    // validation panics if the linker is later used with a store other than the
+    // one `add_export` was called with, as documented.
+    HostFunc::func_new(
+        move |mut store: StoreContextMut<'_, T>,
+              _ty: types::ComponentFunc,
+              params: &[Val],
+              results: &mut [Val]| {
+            // Note the use of `call_in_guest_call` here rather than `call`:
+            // this runs while the calling guest is already on the stack (and,
+            // for async-lowered imports, on a fiber) where `call`'s
+            // `validate_sync_call` check would reject the nested call.
+            func.call_in_guest_call(store.as_context_mut(), params, results)
+        },
+    )
+}
+
+/// Returns the [`ResourceIndex`] that the resource type exported at `index` of
+/// `component` refers to.
+fn exported_resource_index(
+    component: &Component,
+    index: ComponentExportIndex,
+) -> Result<ResourceIndex> {
+    let env_component = component.env_component();
+    match &env_component.export_items[index.index] {
+        Export::Type(TypeDef::Resource(ty)) => match component.types()[*ty] {
+            TypeResourceTable::Concrete { ty, .. } => Ok(ty),
+            TypeResourceTable::Abstract(_) => {
+                bail!("cannot add an abstractly-typed resource export")
+            }
+        },
+        _ => bail!("cannot add a non-resource export as a resource"),
+    }
+}
+
+/// Builds a destructor for `resource`, an export of `instance`, for use with
+/// [`LinkerInstance::add_export`].
+///
+/// The destructor receives the representation of the resource being destroyed
+/// and re-enters `instance` to run the destructor which was registered for that
+/// resource when `instance` itself was instantiated. Note that this is only
+/// reached when a handle is destroyed rather than transferred, and in
+/// particular that guest-to-guest transfers within a single instance bypass
+/// destructors entirely.
+fn forward_resource_dtor<T: 'static>(
+    engine: &Engine,
+    instance: Instance,
+    resource: ResourceIndex,
+) -> Result<Arc<crate::func::HostFunc>> {
+    Ok(try_new::<Arc<_>>(crate::func::HostFunc::wrap(
+        engine,
+        move |mut cx: crate::Caller<'_, T>, (rep,): (u32,)| {
+            drop_forwarded_resource(cx.as_context_mut(), instance, resource, rep)
+        },
+    )?)?)
+}
+
+/// Runs the destructor registered for `resource` in `instance`, which is the
+/// instance that `add_export` forwarded the resource from.
+fn drop_forwarded_resource<T>(
+    mut store: StoreContextMut<'_, T>,
+    instance: Instance,
+    resource: ResourceIndex,
+    rep: u32,
+) -> Result<()> {
+    let data = instance.id().get_mut(store.0);
+    let dtor = data.resource_destructor(resource);
+    let runtime_instance = data
+        .component()
+        .env_component()
+        .defined_resource_instance(resource)
+        .map(|index| RuntimeInstance {
+            instance: data.id(),
+            index,
+        });
+    let dtor = match dtor {
+        Some(dtor) => dtor,
+        None => return Ok(()),
+    };
+    let mut args = [ValRaw::u32(rep)];
+
+    // Set up the async-level task infrastructure for this call, as
+    // `ResourceAny::resource_drop` does, so that the destructor can't block.
+    // Note that `runtime_instance` is `None` for resources which `instance`
+    // itself imported, in which case there's no guest code to enter.
+    if let Some(runtime_instance) = runtime_instance {
+        store.0.enter_guest_sync_call(false, runtime_instance)?;
+    }
+
+    // SAFETY: `dtor` came from the store this call is running in, and resource
+    // destructors are type-checked at instantiation time to take a single
+    // `i32` and return nothing, so the arguments here are correct.
+    let result = unsafe {
+        crate::Func::call_unchecked_raw(
+            &mut store,
+            dtor,
+            NonNull::from(&mut args),
+            UncaughtException::Trap,
+        )
+    };
+    if result.is_err() {
+        store.0.set_trapped();
+    }
+    result?;
+
+    if runtime_instance.is_some() {
+        store.0.exit_guest_sync_call()?;
+    }
+
+    Ok(())
+}
+
 impl<T: 'static> LinkerInstance<'_, T> {
     fn as_mut(&mut self) -> LinkerInstance<'_, T> {
         LinkerInstance {
@@ -1105,6 +1245,119 @@ impl<T: 'static> LinkerInstance<'_, T> {
             },
         )?);
         self.insert(name, Definition::Resource(ty, dtor))?;
+        Ok(())
+    }
+
+    /// Defines `name` within this instance as the export `item` of `instance`.
+    ///
+    /// This method is the dual of [`Instance::get_export`] and is used to wire
+    /// one instantiated component's exports up as another component's imports.
+    /// This is useful when a "plugin" component is instantiated against the
+    /// exports of a previously-instantiated "provider" component, for example
+    /// when a `stream<u8>` produced by a network provider is handed to a
+    /// view-provider selected by mime type.
+    ///
+    /// The `instance` and `item` arguments are the [`Instance`] that the export
+    /// came from and the `(ComponentItem, ComponentExportIndex)` pair returned
+    /// by [`Instance::get_export`], respectively. The `store` provided must be
+    /// the store that `instance` belongs to and all subsequent instantiations
+    /// with this linker must use that same store; otherwise calls through the
+    /// items defined here will fail with an error.
+    ///
+    /// The item kinds supported are:
+    ///
+    /// * Functions, which are forwarded by re-entering the exporting instance.
+    ///   Note that only synchronous functions are supported at this time; an
+    ///   `async` function export produces an error.
+    /// * Resources, which retain the exporting instance's identity so that
+    ///   handles round-trip correctly and the original destructor runs when the
+    ///   resource is finally dropped.
+    /// * Core modules, which are defined directly in this linker.
+    /// * Nested component instances, which are recursively forwarded export by
+    ///   export.
+    ///
+    /// Interface type exports (such as `record` and `variant` definitions) have
+    /// no runtime representation and are skipped.
+    ///
+    /// Note that functions are type-checked dynamically, as with
+    /// [`Self::func_new`], rather than against the type of the export they came
+    /// from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `item` was not produced by `instance`, if `name` is
+    /// already defined within this linker and shadowing is not allowed, or if
+    /// the item cannot be forwarded (for example an `async` function).
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
+    pub fn add_export(
+        &mut self,
+        mut store: impl AsContextMut<Data = T>,
+        name: &str,
+        instance: &Instance,
+        item: &(ComponentItem, ComponentExportIndex),
+    ) -> Result<()> {
+        let (item, index) = item;
+
+        // Make sure the export actually came from the component that `instance`
+        // was created from, which is what makes the runtime lookups below
+        // valid.
+        let component_id = instance.id().get(store.as_context_mut().0).component().id();
+        ensure!(
+            index.id == component_id,
+            "cross-`Component` usage is not supported"
+        );
+
+        match item {
+            ComponentItem::ComponentFunc(_) => {
+                let func = instance
+                    .get_func(store.as_context_mut(), *index)
+                    .ok_or_else(|| format_err!("export `{name}` is not a function"))?;
+                let func = forward_func(store.as_context_mut().0, func)?;
+                self.insert(name, Definition::Func(func))?;
+            }
+
+            ComponentItem::Module(_) => {
+                let module = instance
+                    .get_module(store.as_context_mut(), *index)
+                    .ok_or_else(|| format_err!("export `{name}` is not a module"))?;
+                self.module(name, &module)?;
+            }
+
+            ComponentItem::Resource(ty) => {
+                let component = instance.id().get(store.as_context_mut().0).component();
+                let resource = exported_resource_index(component, *index)?;
+                let dtor = forward_resource_dtor(self.engine, *instance, resource)?;
+                self.insert(name, Definition::Resource(*ty, dtor))?;
+            }
+
+            ComponentItem::ComponentInstance(ty) => {
+                let mut sub = self.instance(name)?;
+
+                // Collect the export names first to avoid holding a borrow of
+                // the store across the recursive calls below.
+                let names = ty
+                    .exports(self.engine)
+                    .map(|(name, _)| name.to_string())
+                    .collect::<Vec<_>>();
+                for sub_name in names {
+                    let item = instance
+                        ._get_export(store.as_context_mut().0, Some(index), &sub_name)
+                        .ok_or_else(|| format_err!("export `{sub_name}` not found"))?;
+                    sub.add_export(store.as_context_mut(), &sub_name, instance, &item)?;
+                }
+            }
+
+            // Interface types are named types with no runtime definition, which
+            // the type-checker skips as well.
+            ComponentItem::Type(_) => {}
+
+            ComponentItem::Component(_) | ComponentItem::CoreFunc(_) => {
+                bail!("cannot add an export of type `{}`", item.desc())
+            }
+        }
         Ok(())
     }
 

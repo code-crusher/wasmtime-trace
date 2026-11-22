@@ -296,7 +296,7 @@ impl Instance {
         self._get_export(store.as_context_mut().0, instance, name)
     }
 
-    fn _get_export(
+    pub(crate) fn _get_export(
         &self,
         store: &StoreOpaque,
         instance: Option<&ComponentExportIndex>,

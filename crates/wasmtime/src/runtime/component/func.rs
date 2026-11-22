@@ -304,6 +304,29 @@ impl Func {
             .await?
     }
 
+    /// Invokes this function while already servicing a call into a guest.
+    ///
+    /// This is the internal entry point used when a host function forwards a
+    /// call to another instance's export, such as through
+    /// [`LinkerInstance::add_export`](crate::component::LinkerInstance::add_export).
+    /// Unlike [`Self::call`] this does not consult the store's
+    /// `validate_sync_call` check, because forwarding happens while guest code
+    /// is already running and, when the outer call was an async one, that guest
+    /// code is on a fiber where a nested blocking call is exactly what's being
+    /// requested. This mirrors `ResourceAny::resource_drop_in_guest_call` for
+    /// resource destruction.
+    ///
+    /// Note that this still rejects async-typed functions, so callers are
+    /// expected to have checked [`Self::is_async`] first.
+    pub(crate) fn call_in_guest_call<T>(
+        &self,
+        mut store: StoreContextMut<'_, T>,
+        params: &[Val],
+        results: &mut [Val],
+    ) -> Result<()> {
+        self.call_impl(store.as_context_mut(), params, results)
+    }
+
     pub(crate) fn check_params_results<T>(
         &self,
         store: StoreContextMut<T>,
