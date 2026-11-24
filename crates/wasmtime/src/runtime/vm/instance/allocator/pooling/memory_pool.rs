@@ -138,6 +138,12 @@ pub struct MemoryPool {
     /// Only applicable on Linux.
     pub(super) keep_resident: HostAlignedByteCount,
 
+    /// Whether GC heap slots are reset when they are reused, as opposed to
+    /// being handed to the next GC heap with their previous contents intact.
+    ///
+    /// See [`PoolingAllocationConfig::gc_heap_zeroing`].
+    gc_heap_zeroing: bool,
+
     /// Keep track of protection keys handed out to initialized stores; this
     /// allows us to round-robin the assignment of stores to stripes.
     next_available_pkey: AtomicUsize,
@@ -285,6 +291,7 @@ impl MemoryPool {
             keep_resident: HostAlignedByteCount::new_rounded_up(
                 config.linear_memory_keep_resident,
             )?,
+            gc_heap_zeroing: config.gc_heap_zeroing,
             next_available_pkey: AtomicUsize::new(0),
         };
 
@@ -357,9 +364,10 @@ impl MemoryPool {
         request: &mut InstanceAllocationRequest<'_, '_>,
         ty: &wasmtime_environ::Memory,
         memory_index: Option<DefinedMemoryIndex>,
+        memory_kind: MemoryKind,
     ) -> Result<(MemoryAllocationIndex, Memory)> {
         let tunables = request.store.engine().tunables();
-        let memory_tunables = MemoryTunables::new(tunables, MemoryKind::LinearMemory);
+        let memory_tunables = MemoryTunables::new(tunables, memory_kind);
         let stripe_index = if let Some(pkey) = request.store.get_pkey() {
             pkey.as_stripe()
         } else {
@@ -427,7 +435,20 @@ impl MemoryPool {
         // mmap that would leave an open space for someone
         // else to come in and map something.
         let initial_size = usize::try_from(initial_size).unwrap();
-        slot.instantiate(initial_size, image, ty, &memory_tunables)?;
+        match memory_kind {
+            MemoryKind::LinearMemory => {
+                slot.instantiate(initial_size, image, ty, &memory_tunables)?;
+            }
+            MemoryKind::GcHeap => {
+                debug_assert!(image.is_none());
+                slot.instantiate_gc_heap(
+                    initial_size,
+                    ty,
+                    &memory_tunables,
+                    self.gc_heap_zeroing,
+                )?;
+            }
+        }
 
         let memory = Memory::new_static(
             ty,

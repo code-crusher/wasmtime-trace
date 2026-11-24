@@ -13,7 +13,9 @@ use alloc::sync::Arc;
 use core::fmt;
 use core::ops::Range;
 use wasmtime_environ::prelude::TryPrimaryMap;
-use wasmtime_environ::{DefinedMemoryIndex, MemoryInitialization, MemoryTunables, Module};
+use wasmtime_environ::{
+    DefinedMemoryIndex, MemoryInitialization, MemoryKind, MemoryTunables, Module,
+};
 
 /// Backing images for memories in a module.
 ///
@@ -394,6 +396,25 @@ pub struct MemoryImageSlot {
     /// `mmap` resets the affected pages back to the default key 0 which is
     /// accessible from every stripe.
     pkey: Option<ProtectionKey>,
+
+    /// Which kind of memory this slot currently holds.
+    ///
+    /// This is `None` when the slot's contents are unknown (e.g. it was never
+    /// used, or the previous allocation failed) and otherwise records the kind
+    /// of memory that was last instantiated here. Resetting a GC heap's slot
+    /// for reuse can skip most of the work required for a linear memory; see
+    /// `clear_and_remain_ready`.
+    kind: Option<MemoryKind>,
+
+    /// Whether this slot's contents are known to be in their original state,
+    /// i.e. zero (or the `image`, if any) throughout the slot.
+    ///
+    /// This is normally true whenever the slot is not dirty, which is what
+    /// `instantiate` requires. It is cleared when a GC heap's slot is reset
+    /// lazily (see `instantiate_gc_heap`) so that a subsequent linear memory
+    /// reusing this slot first wipes it with anonymous memory rather than
+    /// observing stale bytes.
+    pristine: bool,
 }
 
 impl fmt::Debug for MemoryImageSlot {
@@ -433,6 +454,8 @@ impl MemoryImageSlot {
             image: None,
             dirty: false,
             pkey,
+            kind: None,
+            pristine: true,
         }
     }
 
@@ -493,6 +516,14 @@ impl MemoryImageSlot {
         );
         let initial_size_bytes_page_aligned =
             HostAlignedByteCount::new_rounded_up(initial_size_bytes)?;
+
+        // If the slot's contents were not reset when it was last released (a GC
+        // heap may have skipped that; see `clear_and_remain_ready`), then wipe
+        // the slot with anonymous memory before it is handed to a linear
+        // memory, which would otherwise observe the previous instance's data.
+        if !self.pristine {
+            self.reset_with_anon_memory()?;
+        }
 
         // First order of business is to blow away the previous linear memory
         // image if it doesn't match the image specified here. If one is
@@ -565,7 +596,50 @@ impl MemoryImageSlot {
         // Flag ourselves as `dirty` which means that the next operation on this
         // slot is required to be `clear_and_remain_ready`.
         self.dirty = true;
+        self.kind = Some(memory_tunables.kind());
 
+        Ok(())
+    }
+
+    /// Instantiate this slot as a GC heap's backing memory.
+    ///
+    /// This is a specialized version of [`Self::instantiate`] for GC heaps,
+    /// whose wasm-visible size is not observable and which therefore do not
+    /// need the slot's contents reset before they are reused (the collector
+    /// resets its own allocation state when it is attached). When `zeroing` is
+    /// `false` the slot is made entirely accessible and the previous contents
+    /// are left in place; when `true` this defers to [`Self::instantiate`].
+    ///
+    /// GC heaps never have an image, so there is no CoW mapping to manage here.
+    pub(crate) fn instantiate_gc_heap(
+        &mut self,
+        initial_size_bytes: usize,
+        ty: &wasmtime_environ::Memory,
+        memory_tunables: &MemoryTunables<'_>,
+        zeroing: bool,
+    ) -> Result<()> {
+        assert!(!self.dirty);
+        assert_eq!(memory_tunables.kind(), MemoryKind::GcHeap);
+
+        if zeroing {
+            return self.instantiate(initial_size_bytes, None, ty, memory_tunables);
+        }
+
+        // Map the whole slot as read/write. The wasm-level size of a GC heap is
+        // not observable, so there is no need to hide the tail of the slot as
+        // there is for a linear memory. Stale contents are reset by the
+        // collector itself, which never exposes uninitialized memory to the
+        // guest, so they are deliberately left in place here to avoid the cost
+        // of resetting them.
+        assert!(initial_size_bytes <= self.static_size);
+        let static_size = HostAlignedByteCount::new_rounded_up(self.static_size)?;
+        if self.accessible < static_size {
+            self.set_protection(self.accessible..static_size, true)?;
+            self.accessible = static_size;
+        }
+
+        self.dirty = true;
+        self.kind = Some(MemoryKind::GcHeap);
         Ok(())
     }
 
@@ -590,6 +664,11 @@ impl MemoryImageSlot {
     /// process's memory on Linux. Up to that much memory will be `memset` to
     /// zero where the rest of it will be reset or released with `madvise`.
     ///
+    /// When `gc_heap_zeroing` is `false` and this slot was used as a GC heap
+    /// then the reset is skipped entirely: the slot is marked as not pristine,
+    /// so a later linear memory reusing it wipes it first, but no decommit work
+    /// is done now. Linear memory slots are always reset.
+    ///
     /// Returns the number of bytes still resident in memory after this function
     /// has returned.
 
@@ -601,14 +680,30 @@ impl MemoryImageSlot {
         &mut self,
         pagemap: Option<&PageMap>,
         keep_resident: HostAlignedByteCount,
+        gc_heap_zeroing: bool,
         decommit: impl FnMut(*mut u8, usize),
     ) -> Result<usize> {
         assert!(self.dirty);
+
+        // A GC heap's contents do not need to be reset before the slot is
+        // reused by another GC heap: the collector resets its own allocation
+        // state when attached and never exposes uninitialized memory to the
+        // guest. Skipping the reset here is the entire point of this fast path;
+        // see `PoolingAllocationConfig::gc_heap_zeroing`.
+        if !gc_heap_zeroing && self.kind == Some(MemoryKind::GcHeap) {
+            self.pristine = false;
+            self.dirty = false;
+            // Nothing was decommitted, so report the whole accessible region as
+            // still resident. This lets `release_idle_pool_memory` reclaim these
+            // slots later even though this reset did no work.
+            return Ok(self.accessible.byte_count());
+        }
 
         let bytes_resident =
             unsafe { self.reset_all_memory_contents(pagemap, keep_resident, decommit)? };
 
         self.dirty = false;
+        self.pristine = true;
         Ok(bytes_resident)
     }
 
@@ -832,6 +927,8 @@ impl MemoryImageSlot {
 
         self.image = None;
         self.accessible = HostAlignedByteCount::ZERO;
+        self.pristine = true;
+        self.kind = None;
 
         Ok(())
     }
@@ -976,7 +1073,7 @@ mod test {
         // instantiate again; we should see zeroes, even as the
         // reuse-anon-mmap-opt kicks in
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, true, decommit)
             .unwrap();
         assert!(!memfd.is_dirty());
         memfd
@@ -1030,7 +1127,7 @@ mod test {
 
         // Clear and re-instantiate same image
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, true, decommit)
             .unwrap();
         memfd
             .instantiate(
@@ -1045,7 +1142,7 @@ mod test {
 
         // Clear and re-instantiate no image
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, true, decommit)
             .unwrap();
         memfd
             .instantiate(
@@ -1061,7 +1158,7 @@ mod test {
 
         // Clear and re-instantiate image again
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, true, decommit)
             .unwrap();
         memfd
             .instantiate(
@@ -1077,7 +1174,7 @@ mod test {
         // Create another image with different data.
         let image2 = Arc::new(create_memfd_with_data(page_size, &[10, 11, 12, 13]).unwrap());
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, true, decommit)
             .unwrap();
         memfd
             .instantiate(
@@ -1093,7 +1190,7 @@ mod test {
         // Instantiate the original image again; we should notice it's
         // a different image and not reuse the mappings.
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, true, decommit)
             .unwrap();
         memfd
             .instantiate(
@@ -1152,7 +1249,7 @@ mod test {
                 };
 
                 memfd
-                    .clear_and_remain_ready(None, amt_to_memset, decommit)
+                    .clear_and_remain_ready(None, amt_to_memset, true, decommit)
                     .unwrap();
             }
         }
@@ -1178,7 +1275,7 @@ mod test {
                 });
             }
             memfd
-                .clear_and_remain_ready(None, amt_to_memset, decommit)
+                .clear_and_remain_ready(None, amt_to_memset, true, decommit)
                 .unwrap();
         }
     }
@@ -1225,7 +1322,7 @@ mod test {
         }
 
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, true, decommit)
             .unwrap();
         let slice = unsafe { mmap.slice(0..(64 << 10) + page_size) };
         assert_eq!(&[1, 2, 3, 4], &slice[page_size..][..4]);
@@ -1253,7 +1350,7 @@ mod test {
         }
 
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, true, decommit)
             .unwrap();
 
         // Test that memory is still accessible, but it's been reset
@@ -1281,7 +1378,7 @@ mod test {
         }
 
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, true, decommit)
             .unwrap();
 
         // Reset the image to none and double-check everything is back to zero
@@ -1338,7 +1435,7 @@ mod test {
         let assert_pristine_after_reset = |memfd: &mut MemoryImageSlot| unsafe {
             // Wipe the image, keeping some bytes resident.
             memfd
-                .clear_and_remain_ready(pagemap, keep_resident, decommit)
+                .clear_and_remain_ready(pagemap, keep_resident, true, decommit)
                 .unwrap();
 
             // Double check that the contents of memory are as expected after
@@ -1368,7 +1465,7 @@ mod test {
                 )
                 .unwrap();
             memfd
-                .clear_and_remain_ready(pagemap, HostAlignedByteCount::ZERO, decommit)
+                .clear_and_remain_ready(pagemap, HostAlignedByteCount::ZERO, true, decommit)
                 .unwrap();
 
             // Next re-instantiate a final time to get used for the next test.

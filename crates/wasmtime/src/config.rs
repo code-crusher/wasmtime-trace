@@ -4191,6 +4191,9 @@ pub struct PoolingAllocationConfig {
     pub(crate) linear_memory_keep_resident: usize,
     /// Same as `linear_memory_keep_resident` but for tables.
     pub(crate) table_keep_resident: usize,
+    /// Whether GC heap memory is reset when a slot is reused for another GC
+    /// heap.
+    pub(crate) gc_heap_zeroing: bool,
     /// Whether to enable memory protection keys.
     pub(crate) memory_protection_keys: Enabled,
     /// How many memory protection keys to allocate.
@@ -4210,6 +4213,7 @@ impl Default for PoolingAllocationConfig {
             async_stack_keep_resident: 0,
             linear_memory_keep_resident: 0,
             table_keep_resident: 0,
+            gc_heap_zeroing: true,
             memory_protection_keys: Enabled::No,
             max_memory_protection_keys: 16,
             pagemap_scan: Enabled::No,
@@ -4438,6 +4442,36 @@ impl PoolingAllocationConfig {
     /// is applicable to tables instead.
     pub fn table_keep_resident(&mut self, size: usize) -> &mut Self {
         self.table_keep_resident = size;
+        self
+    }
+
+    /// Configures whether the pooling allocator zeroes out GC heap memory when
+    /// a slot is reused.
+    ///
+    /// Unlike linear memories, a GC heap has no observable upper bound: the
+    /// wasm-visible size of a GC heap is an implementation detail and guest
+    /// code cannot grow it. GC heaps also reset themselves when they are
+    /// attached to fresh memory, as the copying collector resets its bump
+    /// allocator and the deferred-reference-counting collector rebuilds its
+    /// free list. Therefore, when a GC heap slot is reused for another GC heap,
+    /// the only reason to reset the slot's contents is defense in depth against
+    /// bugs that would let a guest read uninitialized GC heap memory and thereby
+    /// exfiltrate a previous instance's data.
+    ///
+    /// This option defaults to `true`, which resets GC heap slots on reuse in
+    /// the same manner as linear memories. When set to `false` the pooling
+    /// allocator skips that work and instead immediately maps the entire slot
+    /// as accessible when a GC heap is allocated, letting the collector
+    /// overwrite stale contents on demand. This is faster but relies on the
+    /// collector never exposing uninitialized bytes to the guest.
+    ///
+    /// Note that stale contents are never observable through the wasm-level GC
+    /// API, regardless of this option.
+    ///
+    /// This option has no effect unless the pooling allocator is used together
+    /// with GC.
+    pub fn gc_heap_zeroing(&mut self, enable: bool) -> &mut Self {
+        self.gc_heap_zeroing = enable;
         self
     }
 
@@ -4863,6 +4897,11 @@ impl PoolingAllocationConfig {
     /// [`PoolingAllocationConfig::table_keep_resident`], if enabled.
     pub fn get_table_keep_resident(&self) -> usize {
         self.table_keep_resident
+    }
+
+    /// Returns the configured [`PoolingAllocationConfig::gc_heap_zeroing`].
+    pub fn get_gc_heap_zeroing(&self) -> bool {
+        self.gc_heap_zeroing
     }
 
     /// Returns the configured
